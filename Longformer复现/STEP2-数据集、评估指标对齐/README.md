@@ -55,6 +55,17 @@ python compare_Wikihop.py
 ```
 
 ## 3. TriviaQA
+&emsp;&emsp;TriviaQA 的预处理比较复杂，见 triviaqa_utils 目录。  
+&emsp;&emsp;首先进行数据预处理：  
+```
+cd triviaqa_utils
+# 训练集
+python convert_to_squad_format.py  --triviaqa_file /root/autodl-tmp/data/triviaqa/qa/wikipedia-train.json  --wikipedia_dir /root/autodl-tmp/data/triviaqa/evidence/wikipedia/    --web_dir /root/autodl-tmp/data/triviaqa/evidence/web/  --max_num_tokens 4096    --squad_file /root/autodl-tmp/data/triviaqa/squad-wikipedia-train-4096.json
+
+# 测试集
+python convert_to_squad_format.py  --triviaqa_file /root/autodl-tmp/data/triviaqa/qa/wikipedia-dev.json  --wikipedia_dir /root/autodl-tmp/data/triviaqa/evidence/wikipedia/    --web_dir /root/autodl-tmp/data/triviaqa/evidence/web/  --max_num_tokens 4096    --squad_file /root/autodl-tmp/data/triviaqa/squad-wikipedia-dev-4096.json
+
+```
 
 
 ## 4. ACC & F1

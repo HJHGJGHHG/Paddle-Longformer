@@ -8,7 +8,7 @@ from transformers.models.longformer.configuration_longformer import LongformerCo
 if __name__ == "__main__":
     # def logger
     reprod_logger = ReprodLogger()
-    path = "/root/autodl-tmp/models/longformer-large-4096"
+    path = "/root/autodl-tmp/models/longformer-base-4096"
 
     # prepare tokenizer & model
     tokenizer = LongformerTokenizer.from_pretrained(path)

@@ -146,7 +146,7 @@ class Torch_WikihopQA_Dataset(torch.utils.data.Dataset):
         # get the location of the predicted indices
         predicted_indices = [k for k, token in enumerate(all_candidate_tokens) if token == '[ent]']
         
-        # candidate_ids, support_ids, prediction_indices, correct_prediction_index
+        # candidate_ids, support_ids, predicted_indices, answer_index
         """
         return torch.tensor(candidate_ids), \
                torch.tensor(support_ids), \
@@ -220,7 +220,7 @@ class Paddle_WikihopQA_Dataset(paddle.io.Dataset):
         # get the location of the predicted indices
         predicted_indices = [k for k, token in enumerate(all_candidate_tokens) if token == '[ent]']
         
-        # candidate_ids, support_ids, prediction_indices, correct_prediction_index
+        # candidate_ids, support_ids, predicted_indices, answer_index
         return paddle.to_tensor(candidate_ids, dtype=paddle.int64), \
                paddle.to_tensor(support_ids, dtype=paddle.int64), \
                paddle.to_tensor(predicted_indices, dtype=paddle.int64), \

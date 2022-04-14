@@ -5,8 +5,8 @@ import torch
 
 def generate(seed):
     np.random.seed(seed)
-    # weight = np.random.normal(0, 0.02, (768, 2)).astype("float32")  # base
-    weight = np.random.normal(0, 0.02, (1024, 2)).astype("float32")  # base
+    weight = np.random.normal(0, 0.02, (768, 2)).astype("float32")  # base
+    # weight = np.random.normal(0, 0.02, (1024, 2)).astype("float32")  # base
     paddle_weights = {
         "qa_outputs.weight": weight,
     }
