@@ -1,11 +1,11 @@
+import inspect
 import math
 import paddle
-import inspect
-import logging
 import paddle.nn as nn
 import paddle.nn.functional as F
+
+from typing import Callable, List, Set, Tuple
 from paddle.nn import Layer
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 from paddlenlp.transformers import PretrainedModel, register_base_model
 from paddlenlp.transformers.fnet.modeling import ACT2FN
 
@@ -33,7 +33,7 @@ __all__ = [
 
 class LongformerEmbeddings(Layer):
     """
-        Include embeddings from word, position and token_type embeddings
+    Same as BertEmbeddings with a tiny tweak for positional embeddings indexing.
     """
     
     def __init__(
@@ -47,38 +47,64 @@ class LongformerEmbeddings(Layer):
             pad_token_id,
     ):
         super(LongformerEmbeddings, self).__init__()
-        self.word_embeddings = nn.Embedding(vocab_size, hidden_size, padding_idx=pad_token_id)
+        # self.word_embeddings = nn.Embedding(vocab_size, hidden_size, padding_idx=pad_token_id)
+        self.word_embeddings = nn.Embedding(vocab_size, hidden_size)
         self.position_embeddings = nn.Embedding(max_position_embeddings, hidden_size)
         self.token_type_embeddings = nn.Embedding(type_vocab_size, hidden_size)
         
+        # self.LayerNorm is not snake-cased to stick with TensorFlow model variable name and be able to load
+        # any TensorFlow checkpoint file
         self.layer_norm = nn.LayerNorm(hidden_size, epsilon=layer_norm_eps)
         self.dropout = nn.Dropout(hidden_dropout_prob)
         
+        # position_ids (1, len position emb) is contiguous in memory and exported when serialized
         self.register_buffer("position_ids", paddle.arange(max_position_embeddings).expand((1, -1)))
+        
+        self.padding_idx = pad_token_id
+        self.position_embeddings = nn.Embedding(
+            max_position_embeddings, hidden_size, padding_idx=self.padding_idx
+        )
     
-    def forward(self, input_ids, token_type_ids=None, position_ids=None, inputs_embeds=None, ):
+    def forward(self, input_ids=None, token_type_ids=None, position_ids=None, inputs_embeds=None):
+        if position_ids is None:
+            position_ids = self.create_position_ids_from_input_ids(input_ids, self.padding_idx)
+        
         if input_ids is not None:
             input_shape = input_ids.shape
         else:
             input_shape = inputs_embeds.shape[:-1]
+        
         seq_length = input_shape[1]
         
         if position_ids is None:
             position_ids = self.position_ids[:, :seq_length]
         
         if token_type_ids is None:
-            token_type_ids = paddle.zeros(input_shape, dtype="int64")
+            token_type_ids = paddle.zeros(input_shape, dtype=paddle.int64)
         
         if inputs_embeds is None:
             inputs_embeds = self.word_embeddings(input_ids)
-        
-        token_type_embeddings = self.token_type_embeddings(token_type_ids)
         position_embeddings = self.position_embeddings(position_ids)
+        token_type_embeddings = self.token_type_embeddings(token_type_ids)
         
-        embeddings = inputs_embeds + token_type_embeddings + position_embeddings
+        embeddings = inputs_embeds + position_embeddings + token_type_embeddings
         embeddings = self.layer_norm(embeddings)
         embeddings = self.dropout(embeddings)
         return embeddings
+    
+    def create_position_ids_from_input_ids(self, input_ids, padding_idx):
+        """
+        Replace non-padding symbols with their position numbers. Position numbers begin at padding_idx+1. Padding symbols
+        are ignored. This is modified from fairseq's `utils.make_positions`.
+
+        Args:
+            x: paddle.Tensor x:
+
+        Returns: paddle.Tensor
+        """
+        mask = paddle.cast(input_ids != padding_idx, dtype=paddle.int64)
+        incremental_indices = paddle.cast(paddle.cumsum(mask, axis=1), dtype=mask.dtype) * mask
+        return paddle.cast(incremental_indices, dtype=paddle.int64) + padding_idx
 
 
 class LongformerSelfAttention(Layer):
@@ -143,7 +169,7 @@ class LongformerSelfAttention(Layer):
                     - 0: local attention
                     - +10000: global attention
         """
-        hidden_states = hidden_states.transpose(0, 1)
+        hidden_states = paddle.transpose(hidden_states, perm=[1, 0, 2])
         
         # project hidden states
         query_vectors = self.query(hidden_states)
@@ -158,8 +184,10 @@ class LongformerSelfAttention(Layer):
         # normalize query
         query_vectors /= math.sqrt(self.head_dim)
         
-        query_vectors = query_vectors.view(seq_len, batch_size, self.num_heads, self.head_dim).transpose(0, 1)
-        key_vectors = key_vectors.view(seq_len, batch_size, self.num_heads, self.head_dim).transpose(0, 1)
+        query_vectors = query_vectors.reshape(shape=[seq_len, batch_size, self.num_heads, self.head_dim]).transpose(
+            perm=[1, 0, 2, 3])
+        key_vectors = key_vectors.reshape(shape=[seq_len, batch_size, self.num_heads, self.head_dim]).transpose(
+            perm=[1, 0, 2, 3])
         
         attn_scores = self._sliding_chunks_query_key_matmul(
             query_vectors, key_vectors, self.one_sided_attn_window_size
@@ -169,12 +197,12 @@ class LongformerSelfAttention(Layer):
         remove_from_windowed_attention_mask = (attention_mask != 0)[:, :, None, None]
         
         # cast to fp32/fp16 then replace 1's with -inf
-        float_mask = remove_from_windowed_attention_mask.type_as(query_vectors).masked_fill(
-            remove_from_windowed_attention_mask, -10000.0
-        )
+        float_mask = paddle.cast(remove_from_windowed_attention_mask, dtype=query_vectors.dtype)
+        float_mask = masked_fill(float_mask, remove_from_windowed_attention_mask, -10000.0)
+        
         # diagonal mask with zeros everywhere and -inf inplace of padding
         diagonal_mask = self._sliding_chunks_query_key_matmul(
-            float_mask.new_ones(size=float_mask.shape), float_mask, self.one_sided_attn_window_size
+            paddle.ones(shape=float_mask.shape, dtype=float_mask.dtype), float_mask, self.one_sided_attn_window_size
         )
         
         # pad local attention probs
@@ -220,9 +248,10 @@ class LongformerSelfAttention(Layer):
             assert layer_head_mask.shape == (
                 self.num_heads,
             ), f"Head mask for a single layer should be of size {(self.num_heads,)}, but is {layer_head_mask.shape}"
-            attn_probs = layer_head_mask.view(1, 1, -1, 1) * attn_probs
-        
-        attn_probs = attn_probs.type_as(attn_scores)
+            attn_probs = layer_head_mask.reshape([1, 1, -1, 1]) * attn_probs
+
+        attn_probs = masked_fill(attn_probs, is_index_masked[:, :, None, None], 0.0)
+        attn_probs = paddle.cast(attn_probs, dtype=attn_scores.dtype)
         
         # free memory
         del attn_scores
@@ -230,7 +259,8 @@ class LongformerSelfAttention(Layer):
         # apply dropout
         attn_probs = F.dropout(attn_probs, p=self.dropout, training=self.training)
         
-        value_vectors = value_vectors.view(seq_len, batch_size, self.num_heads, self.head_dim).transpose(0, 1)
+        value_vectors = value_vectors.reshape(shape=[seq_len, batch_size, self.num_heads, self.head_dim]).transpose(
+            perm=[1, 0, 2, 3])
         
         # compute local attention output with global attention value and add
         if is_global_attn:
@@ -248,11 +278,10 @@ class LongformerSelfAttention(Layer):
                 attn_probs, value_vectors, self.one_sided_attn_window_size
             )
         
-        assert attn_output.shape == (batch_size, seq_len, self.num_heads, self.head_dim), "Unexpected size"
-        attn_output = attn_output.transpose(0, 1).reshape(seq_len, batch_size, embed_dim).contiguous()
+        assert attn_output.shape == [batch_size, seq_len, self.num_heads, self.head_dim], "Unexpected size"
+        attn_output = attn_output.transpose(perm=[1, 0, 2, 3]).reshape(shape=[seq_len, batch_size, embed_dim])
         
         # compute value for global attention and overwrite to attention output
-        # TODO: remove the redundant computation
         if is_global_attn:
             global_attn_output, global_attn_probs = self._compute_global_attn_output_from_hidden(
                 hidden_states=hidden_states,
@@ -265,20 +294,23 @@ class LongformerSelfAttention(Layer):
             )
             
             # get only non zero global attn output
-            nonzero_global_attn_output = global_attn_output[
-                                         is_local_index_global_attn_nonzero[0], :, is_local_index_global_attn_nonzero[1]
-                                         ]
+            nonzero_global_attn_output = paddle.to_tensor(
+                global_attn_output.numpy()[is_local_index_global_attn_nonzero[0], :,
+                is_local_index_global_attn_nonzero[1]],
+                stop_gradient=global_attn_output.stop_gradient,
+                dtype=global_attn_output.dtype
+            )
             
             # overwrite values with global attention
-            attn_output[is_index_global_attn_nonzero[::-1]] = nonzero_global_attn_output.view(
-                len(is_local_index_global_attn_nonzero[0]), -1
+            attn_output[is_index_global_attn_nonzero[::-1]] = nonzero_global_attn_output.reshape(
+                shape=[len(is_local_index_global_attn_nonzero[0]), -1]
             )
             # The attention weights for tokens with global attention are
             # just filler values, they were never used to compute the output.
             # Fill with 0 now, the correct values are in 'global_attn_probs'.
             attn_probs[is_index_global_attn_nonzero] = 0
         
-        outputs = (attn_output.transpose(0, 1),)
+        outputs = (attn_output.transpose(perm=[1, 0, 2]),)
         
         if output_attentions:
             outputs += (attn_probs,)
@@ -288,12 +320,11 @@ class LongformerSelfAttention(Layer):
     @staticmethod
     def _pad_and_transpose_last_two_dims(hidden_states_padded, padding):
         """pads rows and then flips rows and columns"""
-        hidden_states_padded = F.pad(
-            hidden_states_padded, padding
-        )  # padding value is not important because it will be overwritten
-        hidden_states_padded = hidden_states_padded.view(
-            *hidden_states_padded.shape[:-2], hidden_states_padded.size(-1), hidden_states_padded.size(-2)
-        )
+        hidden_states_padded = F.pad(hidden_states_padded, padding)
+        # padding value is not important because it will be overwritten
+        hidden_states_padded = paddle.reshape(hidden_states_padded,
+                                              shape=[*hidden_states_padded.shape[:-2], hidden_states_padded.shape[-1],
+                                                     hidden_states_padded.shape[-2]])
         return hidden_states_padded
     
     @staticmethod
@@ -330,17 +361,17 @@ class LongformerSelfAttention(Layer):
                        -0.0405, 0.1599, 0.0000 0.0000, 0.0000, 0.0000, 2.0514, -1.1600, 0.5372, 0.2629 ]
         """
         total_num_heads, num_chunks, window_overlap, hidden_dim = chunked_hidden_states.shape
-        chunked_hidden_states = F.pad(
-            chunked_hidden_states, (0, window_overlap + 1)
-        )  # total_num_heads x num_chunks x window_overlap x (hidden_dim+window_overlap+1). Padding value is not important because it'll be overwritten
-        chunked_hidden_states = chunked_hidden_states.view(
-            total_num_heads, num_chunks, -1
+        # total_num_heads x num_chunks x window_overlap x (hidden_dim+window_overlap+1). Padding value is not important because it'll be overwritten
+        chunked_hidden_states = F.pad(chunked_hidden_states.transpose([0, 1, 3, 2]),
+                                      (0, 0, 0, window_overlap + 1)).transpose([0, 1, 3, 2])
+        chunked_hidden_states = chunked_hidden_states.reshape(
+            shape=[total_num_heads, num_chunks, -1]
         )  # total_num_heads x num_chunks x window_overlap*window_overlap+window_overlap
         chunked_hidden_states = chunked_hidden_states[
                                 :, :, :-window_overlap
                                 ]  # total_num_heads x num_chunks x window_overlap*window_overlap
-        chunked_hidden_states = chunked_hidden_states.view(
-            total_num_heads, num_chunks, window_overlap, window_overlap + hidden_dim
+        chunked_hidden_states = chunked_hidden_states.reshape(
+            shape=[total_num_heads, num_chunks, window_overlap, window_overlap + hidden_dim]
         )
         chunked_hidden_states = chunked_hidden_states[:, :, :, :-1]
         return chunked_hidden_states
@@ -348,34 +379,40 @@ class LongformerSelfAttention(Layer):
     @staticmethod
     def _chunk(hidden_states, window_overlap):
         """convert into overlapping chunks. Chunk size = 2w, overlap size = w"""
+        # transpose [batch_size,seq_length,hidden_dim] -> unsqueeze [batch_size,hidden_dim,seqlen,1] -> unfold [batch_size, hidden_dim*2 * window_overlap, num_output_chunks]
+        # transpose [batch_size,num_output_chunks,hidden_dim*2*window_overlap] -> reshape [batch_size,num_output_chunks,hidden_dim, 2*window_overlap] -> transpose [batch_size,num_output_chunks,2*window_overlap,hidden_dim]
+        batch_size, seq_length, hidden_dim = hidden_states.shape
+        num_output_chunks = 2 * (seq_length // (2 * window_overlap)) - 1
         
-        # non-overlapping chunks of size = 2w
-        hidden_states = hidden_states.view(
-            hidden_states.size(0),
-            hidden_states.size(1) // (window_overlap * 2),
-            window_overlap * 2,
-            hidden_states.size(2),
+        hidden_states = (
+            F.unfold(
+                hidden_states.transpose(perm=[0, 2, 1]).unsqueeze(-1),
+                kernel_sizes=[window_overlap * 2, 1],
+                strides=[window_overlap, 1],
+            )
+                .transpose(perm=[0, 2, 1])
+                .reshape(shape=[batch_size, num_output_chunks, hidden_dim, window_overlap * 2])
+                .transpose(perm=[0, 1, 3, 2])
         )
         
-        # use `as_strided` to make the chunks overlap with an overlap size = window_overlap
-        chunk_size = list(hidden_states.shape)
-        chunk_size[1] = chunk_size[1] * 2 - 1
-        
-        chunk_stride = list(hidden_states.stride())
-        chunk_stride[1] = chunk_stride[1] // 2
-        return hidden_states.as_strided(size=chunk_size, stride=chunk_stride)
+        return hidden_states
     
     @staticmethod
     def _mask_invalid_locations(input_tensor, affected_seq_len) -> paddle.Tensor:
-        beginning_mask_2d = input_tensor.new_ones(affected_seq_len, affected_seq_len + 1).tril().flip(dims=[0])
+        beginning_mask_2d = paddle.flip(
+            paddle.tril(paddle.ones(shape=[affected_seq_len, affected_seq_len + 1], dtype=input_tensor.dtype)), axis=0)
         beginning_mask = beginning_mask_2d[None, :, None, :]
-        ending_mask = beginning_mask.flip(dims=(1, 3))
+        ending_mask = paddle.flip(beginning_mask, axis=[1, 3])
+        
         beginning_input = input_tensor[:, :affected_seq_len, :, : affected_seq_len + 1]
-        beginning_mask = beginning_mask.expand(beginning_input.shape)
-        beginning_input.masked_fill_(beginning_mask == 1, -float("inf"))  # `== 1` converts to bool or uint8
+        beginning_mask = paddle.expand(beginning_mask, shape=beginning_input.shape)
+        input_tensor[:, :affected_seq_len, :, : affected_seq_len + 1] = masked_fill(
+            beginning_input, beginning_mask == 1, -float("inf"))  # `== 1` converts to bool or uint8
+        
         ending_input = input_tensor[:, -affected_seq_len:, :, -(affected_seq_len + 1):]
-        ending_mask = ending_mask.expand(ending_input.shape)
-        ending_input.masked_fill_(ending_mask == 1, -float("inf"))  # `== 1` converts to bool or uint8
+        ending_mask = paddle.expand(ending_mask, shape=ending_input.shape)
+        input_tensor[:, -affected_seq_len:, :, -(affected_seq_len + 1):] = masked_fill(
+            ending_input, ending_mask == 1, -float("inf"))  # `== 1` converts to bool or uint8
     
     def _sliding_chunks_query_key_matmul(self, query: paddle.Tensor, key: paddle.Tensor, window_overlap: int):
         """
@@ -392,8 +429,8 @@ class LongformerSelfAttention(Layer):
         chunks_count = seq_len // window_overlap - 1
         
         # group batch_size and num_heads dimensions into one, then chunk seq_len into chunks of size window_overlap * 2
-        query = query.transpose(1, 2).reshape(batch_size * num_heads, seq_len, head_dim)
-        key = key.transpose(1, 2).reshape(batch_size * num_heads, seq_len, head_dim)
+        query = query.transpose(perm=[0, 2, 1, 3]).reshape(shape=[batch_size * num_heads, seq_len, head_dim])
+        key = key.transpose(perm=[0, 2, 1, 3]).reshape(shape=[batch_size * num_heads, seq_len, head_dim])
         
         query = self._chunk(query, window_overlap)
         key = self._chunk(key, window_overlap)
@@ -402,7 +439,7 @@ class LongformerSelfAttention(Layer):
         # bcxd: batch_size * num_heads x chunks x 2window_overlap x head_dim
         # bcyd: batch_size * num_heads x chunks x 2window_overlap x head_dim
         # bcxy: batch_size * num_heads x chunks x 2window_overlap x 2window_overlap
-        diagonal_chunked_attention_scores = paddle.einsum("bcxd,bcyd->bcxy", (query, key))  # multiply
+        diagonal_chunked_attention_scores = paddle.einsum("bcxd,bcyd->bcxy", query, key)  # multiply
         
         # convert diagonals into columns
         diagonal_chunked_attention_scores = self._pad_and_transpose_last_two_dims(
@@ -414,8 +451,9 @@ class LongformerSelfAttention(Layer):
         # window_overlap previous words). The following column is attention score from each word to itself, then
         # followed by window_overlap columns for the upper triangle.
         
-        diagonal_attention_scores = diagonal_chunked_attention_scores.new_empty(
-            (batch_size * num_heads, chunks_count + 1, window_overlap, window_overlap * 2 + 1)
+        diagonal_attention_scores = paddle.empty(
+            shape=(batch_size * num_heads, chunks_count + 1, window_overlap, window_overlap * 2 + 1),
+            dtype=diagonal_chunked_attention_scores.dtype
         )
         
         # copy parts from diagonal_chunked_attention_scores into the combined matrix of attentions
@@ -437,9 +475,9 @@ class LongformerSelfAttention(Layer):
                                                                               ]
         
         # separate batch_size and num_heads dimensions again
-        diagonal_attention_scores = diagonal_attention_scores.view(
-            batch_size, num_heads, seq_len, 2 * window_overlap + 1
-        ).transpose(2, 1)
+        diagonal_attention_scores = diagonal_attention_scores.reshape(
+            shape=[batch_size, num_heads, seq_len, 2 * window_overlap + 1]
+        ).transpose(perm=[0, 2, 1, 3])
         
         self._mask_invalid_locations(diagonal_attention_scores, window_overlap)
         return diagonal_attention_scores
@@ -455,57 +493,58 @@ class LongformerSelfAttention(Layer):
         
         assert seq_len % (window_overlap * 2) == 0
         assert attn_probs.shape[:3] == value.shape[:3]
-        assert attn_probs.size(3) == 2 * window_overlap + 1
-        chunks_count = seq_len // window_overlap - 1
+        assert attn_probs.shape[3] == 2 * window_overlap + 1
+        chunks_count = seq_len // window_overlap
         # group batch_size and num_heads dimensions into one, then chunk seq_len into chunks of size 2 window overlap
         
-        chunked_attn_probs = attn_probs.transpose(1, 2).reshape(
-            batch_size * num_heads, seq_len // window_overlap, window_overlap, 2 * window_overlap + 1
+        chunked_attn_probs = attn_probs.transpose(perm=[0, 2, 1, 3]).reshape(
+            shape=[batch_size * num_heads, seq_len // window_overlap, window_overlap, 2 * window_overlap + 1]
         )
         
         # group batch_size and num_heads dimensions into one
-        value = value.transpose(1, 2).reshape(batch_size * num_heads, seq_len, head_dim)
+        value = value.transpose(perm=[0, 2, 1, 3]).reshape(shape=[batch_size * num_heads, seq_len, head_dim])
         
         # pad seq_len with w at the beginning of the sequence and another window overlap at the end
-        padded_value = F.pad(value, (0, 0, window_overlap, window_overlap), value=-1)
+        padded_value = paddle.squeeze(F.pad(paddle.unsqueeze(value, axis=0),
+                                            (0, 0, window_overlap, window_overlap),
+                                            value=-1), axis=0)
         
         # chunk padded_value into chunks of size 3 window overlap and an overlap of size window overlap
-        chunked_value_size = (batch_size * num_heads, chunks_count + 1, 3 * window_overlap, head_dim)
-        chunked_value_stride = padded_value.stride()
-        chunked_value_stride = (
-            chunked_value_stride[0],
-            window_overlap * chunked_value_stride[1],
-            chunked_value_stride[1],
-            chunked_value_stride[2],
-        )
-        chunked_value = padded_value.as_strided(size=chunked_value_size, stride=chunked_value_stride)
+        chunked_value = paddle.nn.functional.unfold(padded_value.transpose(perm=[0, 2, 1]).unsqueeze(-1),
+                                                    kernel_sizes=[window_overlap * 3, 1],
+                                                    strides=[window_overlap, 1]).transpose(perm=[0, 2, 1]).reshape(
+            shape=[batch_size * num_heads, chunks_count, head_dim, window_overlap * 3]).transpose(perm=[0, 1, 3, 2])
         
         chunked_attn_probs = self._pad_and_diagonalize(chunked_attn_probs)
         
-        context = paddle.einsum("bcwd,bcdh->bcwh", (chunked_attn_probs, chunked_value))
-        return context.view(batch_size, num_heads, seq_len, head_dim).transpose(1, 2)
+        context = paddle.einsum("bcwd,bcdh->bcwh", chunked_attn_probs, chunked_value)
+        return context.reshape(shape=[batch_size, num_heads, seq_len, head_dim]).transpose(perm=[0, 2, 1, 3])
     
     @staticmethod
     def _get_global_attn_indices(is_index_global_attn):
         """compute global attn indices required throughout forward pass"""
         # helper variable
-        num_global_attn_indices = is_index_global_attn.long().sum(dim=1)
+        num_global_attn_indices = paddle.cast(is_index_global_attn, paddle.int64).sum(axis=1)
         
         # max number of global attn indices in batch
         max_num_global_attn_indices = num_global_attn_indices.max()
         
         # indices of global attn
         is_index_global_attn_nonzero = is_index_global_attn.nonzero(as_tuple=True)
+        is_index_global_attn_nonzero = tuple([item.squeeze() for item in is_index_global_attn_nonzero])
         
         # helper variable
         is_local_index_global_attn = paddle.arange(max_num_global_attn_indices) < num_global_attn_indices.unsqueeze(
-            dim=-1)
+            axis=-1)
         
         # location of the non-padding values within global attention indices
         is_local_index_global_attn_nonzero = is_local_index_global_attn.nonzero(as_tuple=True)
+        is_local_index_global_attn_nonzero = tuple([item.squeeze() for item in is_local_index_global_attn_nonzero])
         
         # location of the padding values within global attention indices
         is_local_index_no_global_attn_nonzero = (is_local_index_global_attn == 0).nonzero(as_tuple=True)
+        is_local_index_no_global_attn_nonzero = tuple(
+            [item.squeeze() for item in is_local_index_no_global_attn_nonzero])
         return (
             max_num_global_attn_indices,
             is_index_global_attn_nonzero,
@@ -525,14 +564,14 @@ class LongformerSelfAttention(Layer):
         batch_size = key_vectors.shape[0]
         
         # create only global key vectors
-        key_vectors_only_global = key_vectors.new_zeros(
-            batch_size, max_num_global_attn_indices, self.num_heads, self.head_dim
+        key_vectors_only_global = paddle.zeros(
+            shape=[batch_size, max_num_global_attn_indices[0], self.num_heads, self.head_dim], dtype=key_vectors.dtype
         )
         
         key_vectors_only_global[is_local_index_global_attn_nonzero] = key_vectors[is_index_global_attn_nonzero]
         
         # (batch_size, seq_len, num_heads, max_num_global_attn_indices)
-        attn_probs_from_global_key = paddle.einsum("blhd,bshd->blhs", (query_vectors, key_vectors_only_global))
+        attn_probs_from_global_key = paddle.einsum("blhd,bshd->blhs", query_vectors, key_vectors_only_global)
         
         attn_probs_from_global_key[
         is_local_index_no_global_attn_nonzero[0], :, :, is_local_index_no_global_attn_nonzero[1]
@@ -551,24 +590,26 @@ class LongformerSelfAttention(Layer):
         batch_size = attn_probs.shape[0]
         
         # cut local attn probs to global only
-        attn_probs_only_global = attn_probs.narrow(-1, 0, max_num_global_attn_indices)
+        max_num_global_attn_indices = max_num_global_attn_indices.tolist()
+        attn_probs_only_global = paddle.slice(attn_probs, axes=[-1], starts=[0], ends=max_num_global_attn_indices)
+        
         # get value vectors for global only
-        value_vectors_only_global = value_vectors.new_zeros(
-            batch_size, max_num_global_attn_indices, self.num_heads, self.head_dim
-        )
+        value_vectors_only_global = paddle.zeros(
+            shape=[batch_size, max_num_global_attn_indices[0], self.num_heads, self.head_dim],
+            dtype=value_vectors.dtype)
         value_vectors_only_global[is_local_index_global_attn_nonzero] = value_vectors[is_index_global_attn_nonzero]
         
         # use `matmul` because `einsum` crashes sometimes with fp16
         # attn = torch.einsum('blhs,bshd->blhd', (selected_attn_probs, selected_v))
         # compute attn output only global
         attn_output_only_global = paddle.matmul(
-            attn_probs_only_global.transpose(1, 2).clone(), value_vectors_only_global.transpose(1, 2).clone()
-        ).transpose(1, 2)
+            attn_probs_only_global.transpose(perm=[0, 2, 1, 3]).clone(),
+            value_vectors_only_global.transpose(perm=[0, 2, 1, 3]).clone()
+        ).transpose(perm=[0, 2, 1, 3])
         
         # reshape attn probs
-        attn_probs_without_global = attn_probs.narrow(
-            -1, max_num_global_attn_indices, attn_probs.size(-1) - max_num_global_attn_indices
-        ).contiguous()
+        attn_probs_without_global = paddle.slice(attn_probs, axes=[-1],
+                                                 starts=max_num_global_attn_indices, ends=[attn_probs.shape[-1]])
         
         # compute attn output with global
         attn_output_without_global = self._sliding_chunks_matmul_attn_probs_value(
@@ -587,9 +628,11 @@ class LongformerSelfAttention(Layer):
             is_index_masked,
     ):
         seq_len, batch_size = hidden_states.shape[:2]
+        max_num_global_attn_indices = max_num_global_attn_indices.tolist()
         
         # prepare global hidden states
-        global_attn_hidden_states = hidden_states.new_zeros(max_num_global_attn_indices, batch_size, self.embed_dim)
+        global_attn_hidden_states = paddle.zeros(
+            shape=[max_num_global_attn_indices[0], batch_size, self.embed_dim], dtype=hidden_states.dtype)
         global_attn_hidden_states[is_local_index_global_attn_nonzero[::-1]] = hidden_states[
             is_index_global_attn_nonzero[::-1]
         ]
@@ -601,41 +644,42 @@ class LongformerSelfAttention(Layer):
         
         # normalize
         global_query_vectors_only_global /= math.sqrt(self.head_dim)
+        # (max_num_global_attn_indices, batch_size, hidden_dim)
         
         # reshape
         global_query_vectors_only_global = (
-            global_query_vectors_only_global.contiguous()
-                .view(max_num_global_attn_indices, batch_size * self.num_heads, self.head_dim)
-                .transpose(0, 1)
+            global_query_vectors_only_global
+                .reshape(shape=[max_num_global_attn_indices[0], batch_size * self.num_heads, self.head_dim])
+                .transpose(perm=[1, 0, 2])
         )  # (batch_size * self.num_heads, max_num_global_attn_indices, head_dim)
         global_key_vectors = (
-            global_key_vectors.contiguous().view(-1, batch_size * self.num_heads, self.head_dim).transpose(0, 1)
+            global_key_vectors.reshape(shape=[-1, batch_size * self.num_heads, self.head_dim]).transpose(perm=[1, 0, 2])
         )  # batch_size * self.num_heads, seq_len, head_dim)
         global_value_vectors = (
-            global_value_vectors.contiguous().view(-1, batch_size * self.num_heads, self.head_dim).transpose(0, 1)
+            global_value_vectors.reshape(shape=[-1, batch_size * self.num_heads, self.head_dim]).transpose(
+                perm=[1, 0, 2])
         )  # batch_size * self.num_heads, seq_len, head_dim)
         
         # compute attn scores
-        global_attn_scores = paddle.bmm(global_query_vectors_only_global, global_key_vectors.transpose(1, 2))
+        global_attn_scores = paddle.bmm(global_query_vectors_only_global, global_key_vectors.transpose(perm=[0, 2, 1]))
         
         assert list(global_attn_scores.shape) == [
             batch_size * self.num_heads,
-            max_num_global_attn_indices,
+            max_num_global_attn_indices[0],
             seq_len,
-        ], f"global_attn_scores have the wrong size. Size should be {(batch_size * self.num_heads, max_num_global_attn_indices, seq_len)}, but is {global_attn_scores.shape}."
+        ], f"global_attn_scores have the wrong size. Size should be {(batch_size * self.num_heads, max_num_global_attn_indices[0], seq_len)}, but is {global_attn_scores.shape}."
         
-        global_attn_scores = global_attn_scores.view(batch_size, self.num_heads, max_num_global_attn_indices, seq_len)
+        global_attn_scores = global_attn_scores.reshape(
+            shape=[batch_size, self.num_heads, max_num_global_attn_indices[0], seq_len])
         
         global_attn_scores[
         is_local_index_no_global_attn_nonzero[0], :, is_local_index_no_global_attn_nonzero[1], :
         ] = -10000.0
         
-        global_attn_scores = global_attn_scores.masked_fill(
-            is_index_masked[:, None, None, :],
-            -10000.0,
-        )
+        global_attn_scores = masked_fill(global_attn_scores, is_index_masked[:, None, None, :], -10000.0, )
         
-        global_attn_scores = global_attn_scores.view(batch_size * self.num_heads, max_num_global_attn_indices, seq_len)
+        global_attn_scores = global_attn_scores.reshape(
+            shape=[batch_size * self.num_heads, max_num_global_attn_indices[0], seq_len])
         
         # compute global attn probs
         # use fp32 for numerical stability
@@ -643,18 +687,18 @@ class LongformerSelfAttention(Layer):
         
         # apply layer head masking
         if layer_head_mask is not None:
-            assert layer_head_mask.shape == (
+            assert layer_head_mask.shape[0] == (
                 self.num_heads,
             ), f"Head mask for a single layer should be of size {(self.num_heads,)}, but is {layer_head_mask.shape}"
-            global_attn_probs_float = layer_head_mask.view(1, -1, 1, 1) * global_attn_probs_float.view(
-                batch_size, self.num_heads, max_num_global_attn_indices, seq_len
+            global_attn_probs_float = layer_head_mask.reshape([1, -1, 1, 1]) * global_attn_probs_float.reshape(
+                shape=[batch_size, self.num_heads, max_num_global_attn_indices[0], seq_len]
             )
-            global_attn_probs_float = global_attn_probs_float.view(
-                batch_size * self.num_heads, max_num_global_attn_indices, seq_len
+            global_attn_probs_float = global_attn_probs_float.reshape(
+                shape=[batch_size * self.num_heads, max_num_global_attn_indices[0], seq_len]
             )
         
         global_attn_probs = nn.functional.dropout(
-            global_attn_probs_float.type_as(global_attn_scores), p=self.dropout, training=self.training
+            paddle.cast(global_attn_probs_float, dtype=global_attn_scores.dtype), p=self.dropout, training=self.training
         )
         
         # global attn output
@@ -662,13 +706,14 @@ class LongformerSelfAttention(Layer):
         
         assert list(global_attn_output.shape) == [
             batch_size * self.num_heads,
-            max_num_global_attn_indices,
+            max_num_global_attn_indices[0],
             self.head_dim,
-        ], f"global_attn_output tensor has the wrong size. Size should be {(batch_size * self.num_heads, max_num_global_attn_indices, self.head_dim)}, but is {global_attn_output.shape}."
+        ], f"global_attn_output tensor has the wrong size. Size should be {(batch_size * self.num_heads, max_num_global_attn_indices[0], self.head_dim)}, but is {global_attn_output.shape}."
         
-        global_attn_probs = global_attn_probs.view(batch_size, self.num_heads, max_num_global_attn_indices, seq_len)
-        global_attn_output = global_attn_output.view(
-            batch_size, self.num_heads, max_num_global_attn_indices, self.head_dim
+        global_attn_probs = global_attn_probs.reshape(
+            shape=[batch_size, self.num_heads, max_num_global_attn_indices[0], seq_len])
+        global_attn_output = global_attn_output.reshape(
+            shape=[batch_size, self.num_heads, max_num_global_attn_indices[0], self.head_dim]
         )
         return global_attn_output, global_attn_probs
 
@@ -894,7 +939,6 @@ class LongformerEncoder(Layer):
             attention_probs_dropout_prob,
             attention_window,
             chunk_size_feed_forward, ) for layer_id in range(num_hidden_layers)])
-        self.gradient_checkpointing = False
     
     def forward(
             self,
@@ -908,7 +952,7 @@ class LongformerEncoder(Layer):
         
         is_index_masked = attention_mask < 0
         is_index_global_attn = attention_mask > 0
-        is_global_attn = is_index_global_attn.flatten().any().item()
+        is_global_attn = is_index_global_attn.numpy().flatten().any().item()
         
         all_hidden_states = () if output_hidden_states else None
         all_attentions = () if output_attentions else None  # All local attentions.
@@ -1007,6 +1051,30 @@ class LongformerLMHead(Layer):
     def _tie_weights(self):
         # To tie those two weights if they get disconnected (on TPU or when the bias is resized)
         self.bias = self.decoder.bias
+
+
+class LongformerClassificationHead(Layer):
+    """Head for sentence-level classification tasks."""
+    
+    def __init__(
+            self,
+            hidden_size,
+            hidden_dropout_prob,
+            num_labels=2
+    ):
+        super(LongformerClassificationHead, self).__init__()
+        self.dense = nn.Linear(hidden_size, hidden_size)
+        self.dropout = nn.Dropout(hidden_dropout_prob)
+        self.out_proj = nn.Linear(hidden_size, num_labels)
+    
+    def forward(self, hidden_states, **kwargs):
+        hidden_states = hidden_states[:, 0, :]  # take <s> token (equiv. to [CLS])
+        hidden_states = self.dropout(hidden_states)
+        hidden_states = self.dense(hidden_states)
+        hidden_states = paddle.tanh(hidden_states)
+        hidden_states = self.dropout(hidden_states)
+        output = self.out_proj(hidden_states)
+        return output
 
 
 class LongformerPreTrainedModel(PretrainedModel):
@@ -1161,6 +1229,7 @@ class LongformerModel(LongformerPreTrainedModel):
             bos_token_id,
             eos_token_id,
             ignore_attention_mask,
+            is_decoder=False,
             add_pooling_layer=True):
         super(LongformerModel, self).__init__()
         
@@ -1175,6 +1244,7 @@ class LongformerModel(LongformerPreTrainedModel):
             )
         self.attention_window = attention_window
         self.initializer_range = initializer_range
+        self.is_decoder = is_decoder
         self.embeddings = LongformerEmbeddings(
             vocab_size,
             hidden_size,
@@ -1207,7 +1277,7 @@ class LongformerModel(LongformerPreTrainedModel):
     
     def _prune_heads(self, heads_to_prune):
         """
-        Prunes heads of the model. heads_to_prune: dict of {layer_num: list of heads to prune in this layer} See base
+        Prunes heads of the model. heads_to_prune: state_dict of {layer_num: list of heads to prune in this layer} See base
         class PreTrainedModel
         """
         for layer, heads in heads_to_prune.items():
@@ -1243,9 +1313,16 @@ class LongformerModel(LongformerPreTrainedModel):
             )
             """
             if input_ids is not None:
-                input_ids = nn.functional.pad(input_ids, (0, padding_len), value=pad_token_id, data_format="NCL")
+                input_ids = paddle.squeeze(
+                    F.pad(paddle.unsqueeze(input_ids, axis=0), (0, padding_len), value=pad_token_id,
+                          data_format="NCL"),
+                    axis=0)
             if position_ids is not None:
-                position_ids = nn.functional.pad(position_ids, (0, padding_len), value=pad_token_id, data_format="NCL")
+                position_ids = paddle.squeeze(
+                    F.pad(paddle.unsqueeze(position_ids, axis=0), (0, padding_len),
+                          value=pad_token_id,
+                          data_format="NCL"),
+                    axis=0)
             if inputs_embeds is not None:
                 input_ids_padding = inputs_embeds.new_full(
                     (batch_size, padding_len),
@@ -1255,12 +1332,18 @@ class LongformerModel(LongformerPreTrainedModel):
                 inputs_embeds_padding = self.embeddings(input_ids_padding)
                 inputs_embeds = paddle.concat([inputs_embeds, inputs_embeds_padding], axis=-2)
             
-            attention_mask = nn.functional.pad(
-                attention_mask, (0, padding_len), value=False, data_format="NCL"
-            )  # no attention on the padding tokens
-            token_type_ids = nn.functional.pad(token_type_ids, (0, padding_len), value=0,
-                                               data_format="NCL")  # pad with token_type_id = 0
-        
+            # no attention on the padding tokens
+            attention_mask = paddle.squeeze(
+                F.pad(paddle.unsqueeze(attention_mask, axis=0), (0, padding_len),
+                      value=False,
+                      data_format="NCL"),
+                axis=0)
+            # pad with token_type_id = 0
+            token_type_ids = paddle.squeeze(
+                F.pad(paddle.unsqueeze(token_type_ids, axis=0), (0, padding_len),
+                      value=0,
+                      data_format="NCL"),
+                axis=0)
         return padding_len, input_ids, attention_mask, token_type_ids, position_ids, inputs_embeds
     
     def _merge_to_attention_mask(self, attention_mask: paddle.Tensor, global_attention_mask: paddle.Tensor):
@@ -1296,7 +1379,7 @@ class LongformerModel(LongformerPreTrainedModel):
             # Provided a padding mask of dimensions [batch_size, seq_length]
             # - if the model is a decoder, apply a causal mask in addition to the padding mask
             # - if the model is an encoder, make the mask broadcastable to [batch_size, num_heads, seq_length, seq_length]
-            if self.config.is_decoder:
+            if self.config["is_decoder"]:
                 extended_attention_mask = self.create_extended_attention_mask_for_decoder(
                     input_shape, attention_mask
                 )
@@ -1442,10 +1525,13 @@ class LongformerModel(LongformerPreTrainedModel):
 
 
 class LongformerForMaskedLM(LongformerPreTrainedModel):
+    """Longformer Model with a `language modeling` head on top."""
+    
     def __init__(self, longformer):
-        super().__init__()
+        super(LongformerForMaskedLM, self).__init__()
         
         self.longformer = longformer
+        self.longformer.pooler = None  # add_pooling_layer=False
         self.lm_head = LongformerLMHead(
             longformer.config["vocab_size"],
             longformer.config["hidden_size"],
@@ -1475,7 +1561,7 @@ class LongformerForMaskedLM(LongformerPreTrainedModel):
             output_hidden_states=None,
     ):
         r"""
-        labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
+        labels (`paddle.Tensor, dtype=int64` of shape `(batch_size, sequence_length)`, *optional*):
             Labels for computing the masked language modeling loss. Indices should be in `[-100, 0, ...,
             config.vocab_size]` (see `input_ids` docstring) Tokens with indices set to `-100` are ignored (masked), the
             loss is only computed for the tokens with labels in `[0, ..., config.vocab_size]`
@@ -1520,19 +1606,375 @@ class LongformerForMaskedLM(LongformerPreTrainedModel):
         masked_lm_loss = None
         if labels is not None:
             loss_fct = nn.CrossEntropyLoss()
-            masked_lm_loss = loss_fct(prediction_scores.view(-1, self.longformer.config["vocab_size"]), labels.view(-1))
+            masked_lm_loss = loss_fct(prediction_scores.reshape([-1, self.longformer.config["vocab_size"]]),
+                                      labels.reshape([-1]))
         
         output = (prediction_scores,) + outputs[2:]
         return ((masked_lm_loss,) + output) if masked_lm_loss is not None else output
 
 
-"""
 class LongformerForSequenceClassification(LongformerPreTrainedModel):
-class LongformerClassificationHead(Layer):
- class LongformerForQuestionAnswering(LongformerPreTrainedModel):
+    def __init__(
+            self,
+            longformer,
+            num_labels=2
+    ):
+        super(LongformerForSequenceClassification, self).__init__()
+        self.num_labels = num_labels
+        
+        self.longformer = longformer
+        self.longformer.pooler = None  # add_pooling_layer=False
+        self.classifier = LongformerClassificationHead(
+            hidden_size=longformer.config["hidden_size"],
+            hidden_dropout_prob=longformer.config["hidden_dropout_prob"],
+            num_labels=num_labels)
+        
+        # Initialize weights and apply final processing
+        self.init_weights()
+    
+    def forward(
+            self,
+            input_ids=None,
+            attention_mask=None,
+            global_attention_mask=None,
+            head_mask=None,
+            token_type_ids=None,
+            position_ids=None,
+            inputs_embeds=None,
+            labels=None,
+            output_attentions=None,
+            output_hidden_states=None,
+    ):
+        r"""
+        labels (`paddle.Tensor, dtype=paddle.int64` of shape `(batch_size,)`, *optional*):
+            Labels for computing the sequence classification/regression loss. Indices should be in `[0, ...,
+            config.num_labels - 1]`. If `config.num_labels == 1` a regression loss is computed (Mean-Square loss), If
+            `config.num_labels > 1` a classification loss is computed (Cross-Entropy).
+        """
+        if global_attention_mask is None:
+            # Initializing global attention on CLS token...
+            global_attention_mask = paddle.zeros(shape=input_ids.shape, dtype=input_ids.dtype)
+            # global attention on cls token
+            global_attention_mask[:, 0] = 1
+        
+        outputs = self.longformer(
+            input_ids,
+            attention_mask=attention_mask,
+            global_attention_mask=global_attention_mask,
+            head_mask=head_mask,
+            token_type_ids=token_type_ids,
+            position_ids=position_ids,
+            inputs_embeds=inputs_embeds,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+        )
+        sequence_output = outputs[0]
+        logits = self.classifier(sequence_output)
+        
+        loss = None
+        if labels is not None:
+            if self.num_labels == 1:
+                self.problem_type = "regression"
+            elif self.num_labels > 1 and (labels.dtype == paddle.int64 or labels.dtype == paddle.int32):
+                self.problem_type = "single_label_classification"
+            else:
+                self.problem_type = "multi_label_classification"
+            
+            if self.problem_type == "regression":
+                loss_fct = nn.MSELoss()
+                if self.num_labels == 1:
+                    loss = loss_fct(logits.squeeze(), labels.squeeze())
+                else:
+                    loss = loss_fct(logits, labels)
+            elif self.problem_type == "single_label_classification":
+                loss_fct = nn.CrossEntropyLoss()
+                loss = loss_fct(logits.reshape([-1, self.num_labels]), labels.reshape([-1]))
+            elif self.problem_type == "multi_label_classification":
+                loss_fct = nn.BCEWithLogitsLoss()
+                loss = loss_fct(logits, labels)
+        
+        output = (logits,) + outputs[2:]
+        return ((loss,) + output) if loss is not None else output
+
+
+class LongformerForQuestionAnswering(LongformerPreTrainedModel):
+    """
+        Longformer Model with a span classification head on top for extractive question-answering tasks like SQuAD /
+        TriviaQA (a linear layers on top of the hidden-states output to compute `span start logits` and `span end logits`).
+    """
+    
+    def __init__(
+            self,
+            longformer,
+            num_labels=2
+    ):
+        super(LongformerForQuestionAnswering, self).__init__()
+        self.longformer = longformer
+        self.longformer.pooler = None  # add_pooling_layer=False
+        self.qa_outputs = nn.Linear(longformer.config["hidden_size"], num_labels)
+        
+        # Initialize weights and apply final processing
+        self.init_weights()
+    
+    def forward(
+            self,
+            input_ids=None,
+            attention_mask=None,
+            global_attention_mask=None,
+            head_mask=None,
+            token_type_ids=None,
+            position_ids=None,
+            inputs_embeds=None,
+            start_positions=None,
+            end_positions=None,
+            output_attentions=None,
+            output_hidden_states=None,
+    ):
+        r"""
+        start_positions (`paddle.Tensor, dtype=int64` of shape `(batch_size,)`, *optional*):
+            Labels for position (index) of the start of the labelled span for computing the token classification loss.
+            Positions are clamped to the length of the sequence (`sequence_length`). Position outside of the sequence
+            are not taken into account for computing the loss.
+        end_positions (`paddle.Tensor, dtype=int64` of shape `(batch_size,)`, *optional*):
+            Labels for position (index) of the end of the labelled span for computing the token classification loss.
+            Positions are clamped to the length of the sequence (`sequence_length`). Position outside of the sequence
+            are not taken into account for computing the loss.
+
+        Returns:
+
+        Examples:
+
+        ```python
+        >>> from tokenizer import LongformerTokenizer
+        >>> import paddle
+
+        >>> tokenizer = LongformerTokenizer.from_pretrained("longformer-large-4096")
+        >>> model = LongformerForQuestionAnswering.from_pretrained("longformer-large-4096")
+
+        >>> question, text = "Who was Jim Henson?", "Jim Henson was a nice puppet"
+        >>> encoding = tokenizer.encode(question, text, return_attention_mask=True)
+        >>> input_ids = encoding["input_ids"]
+
+        >>> # default is local attention everywhere
+        >>> # the forward method will automatically set global attention on question tokens
+        >>> attention_mask = encoding["attention_mask"]
+        >>> token_type_ids = encoding["token_type_ids"]
+
+        >>> outputs = model(input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids)
+        >>> start_logits = outputs.start_logits
+        >>> end_logits = outputs.end_logits
+        >>> all_tokens = tokenizer.convert_ids_to_tokens(input_ids.tolist())
+
+        >>> answer_tokens = all_tokens[torch.argmax(start_logits) : torch.argmax(end_logits) + 1]
+        >>> answer = tokenizer.decode(
+        ...     tokenizer.convert_tokens_to_ids(answer_tokens)
+        >>> )  # remove space prepending space token
+        ```"""
+        if global_attention_mask is None:
+            if input_ids is None:
+                pass
+            # "It is not possible to automatically generate the `global_attention_mask` because input_ids is None. Please make sure that it is correctly set."
+            else:
+                # set global attention on question tokens automatically
+                global_attention_mask = _compute_global_attention_mask(input_ids,
+                                                                       self.longformer.config["sep_token_id"])
+        
+        outputs = self.longformer(
+            input_ids,
+            attention_mask=attention_mask,
+            global_attention_mask=global_attention_mask,
+            head_mask=head_mask,
+            token_type_ids=token_type_ids,
+            position_ids=position_ids,
+            inputs_embeds=inputs_embeds,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+        )
+        
+        sequence_output = outputs[0]
+        
+        logits = self.qa_outputs(sequence_output)
+        start_logits, end_logits = paddle.split(logits, num_or_sections=[1, 1], axis=-1)
+        start_logits = start_logits.squeeze(-1)
+        end_logits = end_logits.squeeze(-1)
+        
+        total_loss = None
+        if start_positions is not None and end_positions is not None:
+            # If we are on multi-GPU, split add a dimension
+            if len(start_positions.shape) > 1:
+                start_positions = start_positions.squeeze(-1)
+            if len(end_positions.shape) > 1:
+                end_positions = end_positions.squeeze(-1)
+            # sometimes the start/end positions are outside our model inputs, we ignore these terms
+            ignored_index = start_logits.size(1)
+            start_positions = start_positions.clamp(0, ignored_index)
+            end_positions = end_positions.clamp(0, ignored_index)
+            
+            loss_fct = nn.CrossEntropyLoss(ignore_index=ignored_index)
+            start_loss = loss_fct(start_logits, start_positions)
+            end_loss = loss_fct(end_logits, end_positions)
+            total_loss = (start_loss + end_loss) / 2
+        
+        output = (start_logits, end_logits) + outputs[2:]
+        return ((total_loss,) + output) if total_loss is not None else output
+
+
 class LongformerForTokenClassification(LongformerPreTrainedModel):
+    """
+        Longformer Model with a token classification head on top (a linear layer on top of the hidden-states output) e.g.
+        for Named-Entity-Recognition (NER) tasks.
+    """
+    
+    def __init__(
+            self,
+            longformer,
+            num_labels=2
+    ):
+        super(LongformerForTokenClassification, self).__init__()
+        self.num_labels = num_labels
+        
+        self.longformer = longformer
+        self.longformer.pooler = None  # add_pooling_layer=False
+        self.dropout = nn.Dropout(longformer.config["hidden_dropout_prob"])
+        self.classifier = nn.Linear(longformer.config["hidden_size"], num_labels)
+        
+        # Initialize weights and apply final processing
+        self.init_weights()
+    
+    def forward(
+            self,
+            input_ids=None,
+            attention_mask=None,
+            global_attention_mask=None,
+            head_mask=None,
+            token_type_ids=None,
+            position_ids=None,
+            inputs_embeds=None,
+            labels=None,
+            output_attentions=None,
+            output_hidden_states=None,
+    ):
+        r"""
+        labels (`paddle.Tensor, dtype=int64` of shape `(batch_size, sequence_length)`, *optional*):
+            Labels for computing the token classification loss. Indices should be in `[0, ..., config.num_labels - 1]`.
+        """
+        outputs = self.longformer(
+            input_ids,
+            attention_mask=attention_mask,
+            global_attention_mask=global_attention_mask,
+            head_mask=head_mask,
+            token_type_ids=token_type_ids,
+            position_ids=position_ids,
+            inputs_embeds=inputs_embeds,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+        )
+        
+        sequence_output = outputs[0]
+        
+        sequence_output = self.dropout(sequence_output)
+        logits = self.classifier(sequence_output)
+        
+        loss = None
+        if labels is not None:
+            loss_fct = nn.CrossEntropyLoss()
+            loss = loss_fct(logits.reshape([-1, self.num_labels]), labels.reshape([-1]))
+        
+        output = (logits,) + outputs[2:]
+        return ((loss,) + output) if loss is not None else output
+
+
 class LongformerForMultipleChoice(LongformerPreTrainedModel):
-"""
+    """
+        Longformer Model with a multiple choice classification head on top (a linear layer on top of the pooled output and
+        a softmax) e.g. for RocStories/SWAG tasks.
+    """
+    
+    def __init__(self, longformer, ):
+        super(LongformerForMultipleChoice, self).__init__()
+        
+        self.longformer = longformer
+        self.dropout = nn.Dropout(longformer.config["hidden_dropout_prob"])
+        self.classifier = nn.Linear(longformer.config["hidden_size"], 1)
+        
+        # Initialize weights and apply final processing
+        self.init_weights()
+    
+    def forward(
+            self,
+            input_ids=None,
+            token_type_ids=None,
+            attention_mask=None,
+            global_attention_mask=None,
+            head_mask=None,
+            labels=None,
+            position_ids=None,
+            inputs_embeds=None,
+            output_attentions=None,
+            output_hidden_states=None,
+    ):
+        r"""
+        labels (`paddle.Tensor, dtype=int64` of shape `(batch_size,)`, *optional*):
+            Labels for computing the multiple choice classification loss. Indices should be in `[0, ...,
+            num_choices-1]` where `num_choices` is the size of the second dimension of the input tensors. (See
+            `input_ids` above)
+        """
+        num_choices = input_ids.shape[1] if input_ids is not None else inputs_embeds.shape[1]
+        
+        # set global attention on question tokens
+        if global_attention_mask is None and input_ids is not None:
+            # "Initializing global attention on multiple choice..."
+            # put global attention on all tokens after `config.sep_token_id`
+            global_attention_mask = paddle.stack(
+                [
+                    _compute_global_attention_mask(input_ids[:, i], self.longformer.config["sep_token_id"],
+                                                   before_sep_token=False)
+                    for i in range(num_choices)
+                ],
+                axis=1,
+            )
+        
+        flat_input_ids = input_ids.reshape([-1, input_ids.size(-1)]) if input_ids is not None else None
+        flat_position_ids = position_ids.reshape(-1, position_ids.size(-1)) if position_ids is not None else None
+        flat_token_type_ids = token_type_ids.reshape(
+            [-1, token_type_ids.size(-1)]) if token_type_ids is not None else None
+        flat_attention_mask = attention_mask.reshape(
+            [-1, attention_mask.size(-1)]) if attention_mask is not None else None
+        flat_global_attention_mask = (
+            global_attention_mask.reshape([-1, global_attention_mask.size(-1)])
+            if global_attention_mask is not None
+            else None
+        )
+        flat_inputs_embeds = (
+            inputs_embeds.reshape([-1, inputs_embeds.size(-2), inputs_embeds.size(-1)])
+            if inputs_embeds is not None
+            else None
+        )
+        
+        outputs = self.longformer(
+            flat_input_ids,
+            position_ids=flat_position_ids,
+            token_type_ids=flat_token_type_ids,
+            attention_mask=flat_attention_mask,
+            global_attention_mask=flat_global_attention_mask,
+            head_mask=head_mask,
+            inputs_embeds=flat_inputs_embeds,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+        )
+        pooled_output = outputs[1]
+        
+        pooled_output = self.dropout(pooled_output)
+        logits = self.classifier(pooled_output)
+        reshaped_logits = logits.reshape([-1, num_choices])
+        
+        loss = None
+        if labels is not None:
+            loss_fct = nn.CrossEntropyLoss()
+            loss = loss_fct(reshaped_logits, labels)
+        
+        output = (reshaped_logits,) + outputs[2:]
+        return ((loss,) + output) if loss is not None else output
 
 
 def prune_linear_layer(layer, index, axis: int = 0) -> nn.Linear:
@@ -1559,11 +2001,11 @@ def prune_linear_layer(layer, index, axis: int = 0) -> nn.Linear:
     new_size[axis] = len(index)
     new_layer = nn.Linear(new_size[1], new_size[0], bias_attr=layer.bias is not None)
     new_layer.weight.requires_grad = False
-    new_layer.weight.copy_(W.contiguous())
+    new_layer.weight.copy_(W)
     new_layer.weight.requires_grad = True
     if layer.bias is not None:
         new_layer.bias.requires_grad = False
-        new_layer.bias.copy_(b.contiguous())
+        new_layer.bias.copy_(b)
         new_layer.bias.requires_grad = True
     return new_layer
 
@@ -1589,7 +2031,7 @@ def find_pruneable_heads_and_indices(
         # Compute how many pruned heads are before the head and move the index accordingly
         head = head - sum(1 if h < head else 0 for h in already_pruned_heads)
         mask[head] = 0
-    mask = mask.view(-1).contiguous().eq(1)
+    mask = mask.reshape([-1]).eq(1)
     index: paddle.Tensor(dtype=paddle.int64) = paddle.arange(len(mask))[mask].long()
     return heads, index
 
@@ -1667,3 +2109,44 @@ def apply_chunking_to_forward(
         return paddle.concat(output_chunks, axis=chunk_dim)
     
     return forward_fn(*input_tensors)
+
+
+def masked_fill(x, mask, value):
+    y = paddle.full(x.shape, value, x.dtype)
+    return paddle.where(mask, y, x)
+
+
+def _get_question_end_index(input_ids, sep_token_id):
+    """
+    Computes the index of the first occurrence of `sep_token_id`.
+    """
+    
+    sep_token_indices = (input_ids == sep_token_id).nonzero()
+    batch_size = input_ids.shape[0]
+    
+    assert sep_token_indices.shape[1] == 2, "`input_ids` should have two dimensions"
+    assert (
+            sep_token_indices.shape[0] == 3 * batch_size
+    ), f"There should be exactly three separator tokens: {sep_token_id} in every sample for questions answering. You might also consider to set `global_attention_mask` manually in the forward function to avoid this error."
+    return sep_token_indices.reshape([batch_size, 3, 2])[:, 0, 1]
+
+
+def _compute_global_attention_mask(input_ids, sep_token_id, before_sep_token=True):
+    """
+    Computes global attention mask by putting attention on all tokens before `sep_token_id` if `before_sep_token is
+    True` else after `sep_token_id`.
+    """
+    question_end_index = _get_question_end_index(input_ids, sep_token_id)
+    question_end_index = question_end_index.unsqueeze(axis=1)  # size: batch_size x 1
+    # bool attention mask with True in locations of global attention
+    attention_mask = paddle.arange(end=input_ids.shape[1])
+    if before_sep_token is True:
+        attention_mask = paddle.cast((attention_mask.expand_as(input_ids) < question_end_index), paddle.int64)
+    else:
+        # last token is separation token and should not be counted and in the middle are two separation tokens
+        attention_mask = paddle.cast(
+            paddle.cast(attention_mask.expand_as(input_ids) > (question_end_index + 1), paddle.int64) * (
+                    attention_mask.expand_as(input_ids) < input_ids.shape[-1]
+            ), paddle.int64)
+    
+    return attention_mask

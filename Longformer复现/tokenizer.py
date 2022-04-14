@@ -3,6 +3,7 @@ from paddlenlp.transformers.tokenizer_utils import AddedToken
 from paddlenlp.transformers.roberta.tokenizer import RobertaBPETokenizer
 
 from transformers.models.longformer.tokenization_longformer import LongformerTokenizer as PTLongformerTokenizer
+
 __all__ = [
     "LongformerTokenizer",
 ]
@@ -85,15 +86,15 @@ class LongformerTokenizer(RobertaBPETokenizer):
     pretrained_resource_files_map = {
         "vocab_file": {
             "longformer-base-4096":
-                "D:/python/pyprojects/论文复现与实验/models/longformer-base-4096/vocab.json",
+                "/root/autodl-tmp/models/paddle-longformer-base/vocab.json",
             "longformer-large-4096":
-                "D:/python/pyprojects/论文复现与实验/models/longformer-base-4096/vocab.json",
+                "/root/autodl-tmp/models/paddle-longformer-large/vocab.json",
         },
         "merges_file": {
             "longformer-base-4096":
-                "D:/python/pyprojects/论文复现与实验/models/longformer-base-4096/merges.txt",
+                "/root/autodl-tmp/models/paddle-longformer-base/merges.txt",
             "longformer-large-4096":
-                "D:/python/pyprojects/论文复现与实验/models/longformer-base-4096/merges.txt"
+                "/root/autodl-tmp/models/paddle-longformer-large/merges.txt"
         }
     }
     pretrained_init_configuration = {
@@ -104,6 +105,11 @@ class LongformerTokenizer(RobertaBPETokenizer):
             "add_prefix": True
         }
     }
+    
+    def _tokenize(self, text, add_prefix_space=False):
+        if add_prefix_space:
+            text = " " + text
+        return super()._tokenize(text)
 
 
 if __name__ == '__main__':
@@ -113,5 +119,5 @@ if __name__ == '__main__':
     print(tokenizer_pytorch.encode_plus(text))
     print(tokenizer_paddle.encode(text))
     
-    print(tokenizer_pytorch(text))
-    print(tokenizer_paddle(text))
+    print(tokenizer_pytorch.tokenize(text, add_prefix_space=True))
+    print(tokenizer_paddle.tokenize(text, add_prefix_space=True))

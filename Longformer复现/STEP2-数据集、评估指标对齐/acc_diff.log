@@ -1,0 +1,6 @@
+[2022/04/14 12:33:30] root INFO: accuracy: 
+[2022/04/14 12:33:30] root INFO: 	mean diff: check passed: True, value: 0.0
+[2022/04/14 12:33:30] root INFO: diff check passed
+[2022/04/14 12:33:30] root INFO: f1: 
+[2022/04/14 12:33:30] root INFO: 	mean diff: check passed: True, value: 0.0
+[2022/04/14 12:33:30] root INFO: diff check passed

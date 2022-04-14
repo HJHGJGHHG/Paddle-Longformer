@@ -1,0 +1,11 @@
+[2022/04/14 15:51:12] root INFO: step_100_lr: 
+[2022/04/14 15:51:12] root INFO: 	mean diff: check passed: True, value: 0.0
+[2022/04/14 15:51:12] root INFO: step_500_lr: 
+[2022/04/14 15:51:12] root INFO: 	mean diff: check passed: True, value: 0.0
+[2022/04/14 15:51:12] root INFO: step_1000_lr: 
+[2022/04/14 15:51:12] root INFO: 	mean diff: check passed: True, value: 0.0
+[2022/04/14 15:51:12] root INFO: step_2000_lr: 
+[2022/04/14 15:51:12] root INFO: 	mean diff: check passed: True, value: 0.0
+[2022/04/14 15:51:12] root INFO: step_4000_lr: 
+[2022/04/14 15:51:12] root INFO: 	mean diff: check passed: True, value: 0.0
+[2022/04/14 15:51:12] root INFO: diff check passed

@@ -11,7 +11,7 @@ def convert_pytorch_checkpoint_to_paddle(
     hf_to_paddle = {
         "embeddings.LayerNorm": "embeddings.layer_norm",
         ".LayerNorm.": ".layer_norm.",
-        "encoder.layer": "encoder.layers",
+        # "encoder.layer": "encoder.layers",
     }
     do_not_transpose = []
     if version == "old":
@@ -31,7 +31,8 @@ def convert_pytorch_checkpoint_to_paddle(
             # embeddings.weight and LayerNorm.weight do not transpose
             if all(d not in k for d in do_not_transpose):
                 # if ".embeddings." not in k and ".LayerNorm." not in k:
-                if (".embeddings." not in k and "attention" not in k and ".LayerNorm." not in k) or "dense" in k or "decoder" in k or "classifier" in k:
+                if (
+                        ".embeddings." not in k and "attention" not in k and ".LayerNorm." not in k) or "dense" in k or "decoder" in k or "classifier" in k or "key" in k or "query" in k or "value" in k:
                     if v.ndim == 2:
                         v = v.transpose(0, 1)
                         is_transpose = True
@@ -68,9 +69,9 @@ if __name__ == "__main__":
     
     parser = argparse.ArgumentParser()
     parser.add_argument("--torch_file",
-                        default="D:/python/pyprojects/论文复现与实验/models/longformer-base-4096/pytorch_model.bin")
+                        default="/root/autodl-tmp/models/longformer-large-4096/pytorch_model.bin")
     parser.add_argument("--paddle_file",
-                        default="D:/python/pyprojects/论文复现与实验/models/paddle-longformer-base/model_state.pdparams")
+                        default="/root/autodl-tmp/models/paddle-longformer-large/model_state.pdparams")
     
     args = parser.parse_args([])
     convert_pytorch_checkpoint_to_paddle(args.torch_file, args.paddle_file)
