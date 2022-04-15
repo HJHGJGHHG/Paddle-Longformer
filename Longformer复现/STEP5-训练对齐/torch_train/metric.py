@@ -84,17 +84,26 @@ class Accuracy(datasets.Metric):
                  sample_weight=None,
                  average='binary'):
         return {
-            """
             "accuracy": accuracy_score(
                 references,
                 predictions,
                 normalize=normalize,
                 sample_weight=sample_weight, ).item(),
-            """
+        }
+    
+    """
+    return {
+            "accuracy": accuracy_score(
+                references,
+                predictions,
+                normalize=normalize,
+                sample_weight=sample_weight, ).item(),
+            
             "f1": f1_score(
                 references,
                 predictions,
                 average='binary',
                 sample_weight=sample_weight, ).item(),
-            
         }
+    
+    """

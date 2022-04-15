@@ -69,9 +69,9 @@ if __name__ == "__main__":
     
     parser = argparse.ArgumentParser()
     parser.add_argument("--torch_file",
-                        default="/root/autodl-tmp/models/longformer-large-4096/pytorch_model.bin")
+                        default="/root/autodl-tmp/models/longformer-base-4096/pytorch_model.bin")
     parser.add_argument("--paddle_file",
-                        default="/root/autodl-tmp/models/paddle-longformer-large/model_state.pdparams")
+                        default="/root/autodl-tmp/models/paddle-longformer-base/model_state.pdparams")
     
     args = parser.parse_args([])
     convert_pytorch_checkpoint_to_paddle(args.torch_file, args.paddle_file)

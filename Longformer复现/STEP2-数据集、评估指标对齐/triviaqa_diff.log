@@ -1,0 +1,51 @@
+[2022/04/15 12:18:53] root INFO: dataloader_0_0: 
+[2022/04/15 12:18:53] root INFO: 	mean diff: check passed: True, value: 0.0
+[2022/04/15 12:18:53] root INFO: dataloader_0_1: 
+[2022/04/15 12:18:53] root INFO: 	mean diff: check passed: True, value: 0.0
+[2022/04/15 12:18:53] root INFO: dataloader_0_2: 
+[2022/04/15 12:18:53] root INFO: 	mean diff: check passed: True, value: 0.0
+[2022/04/15 12:18:53] root INFO: dataloader_0_3: 
+[2022/04/15 12:18:53] root INFO: 	mean diff: check passed: True, value: 0.0
+[2022/04/15 12:18:53] root INFO: dataloader_0_4: 
+[2022/04/15 12:18:53] root INFO: 	mean diff: check passed: True, value: 0.0
+[2022/04/15 12:18:53] root INFO: dataloader_1_0: 
+[2022/04/15 12:18:53] root INFO: 	mean diff: check passed: True, value: 0.0
+[2022/04/15 12:18:53] root INFO: dataloader_1_1: 
+[2022/04/15 12:18:53] root INFO: 	mean diff: check passed: True, value: 0.0
+[2022/04/15 12:18:53] root INFO: dataloader_1_2: 
+[2022/04/15 12:18:53] root INFO: 	mean diff: check passed: True, value: 0.0
+[2022/04/15 12:18:53] root INFO: dataloader_1_3: 
+[2022/04/15 12:18:53] root INFO: 	mean diff: check passed: True, value: 0.0
+[2022/04/15 12:18:53] root INFO: dataloader_1_4: 
+[2022/04/15 12:18:53] root INFO: 	mean diff: check passed: True, value: 0.0
+[2022/04/15 12:18:54] root INFO: dataloader_2_0: 
+[2022/04/15 12:18:54] root INFO: 	mean diff: check passed: True, value: 0.0
+[2022/04/15 12:18:54] root INFO: dataloader_2_1: 
+[2022/04/15 12:18:54] root INFO: 	mean diff: check passed: True, value: 0.0
+[2022/04/15 12:18:54] root INFO: dataloader_2_2: 
+[2022/04/15 12:18:54] root INFO: 	mean diff: check passed: True, value: 0.0
+[2022/04/15 12:18:54] root INFO: dataloader_2_3: 
+[2022/04/15 12:18:54] root INFO: 	mean diff: check passed: True, value: 0.0
+[2022/04/15 12:18:54] root INFO: dataloader_2_4: 
+[2022/04/15 12:18:54] root INFO: 	mean diff: check passed: True, value: 0.0
+[2022/04/15 12:18:54] root INFO: dataloader_3_0: 
+[2022/04/15 12:18:54] root INFO: 	mean diff: check passed: True, value: 0.0
+[2022/04/15 12:18:54] root INFO: dataloader_3_1: 
+[2022/04/15 12:18:54] root INFO: 	mean diff: check passed: True, value: 0.0
+[2022/04/15 12:18:54] root INFO: dataloader_3_2: 
+[2022/04/15 12:18:54] root INFO: 	mean diff: check passed: True, value: 0.0
+[2022/04/15 12:18:54] root INFO: dataloader_3_3: 
+[2022/04/15 12:18:54] root INFO: 	mean diff: check passed: True, value: 0.0
+[2022/04/15 12:18:54] root INFO: dataloader_3_4: 
+[2022/04/15 12:18:54] root INFO: 	mean diff: check passed: True, value: 0.0
+[2022/04/15 12:18:54] root INFO: dataloader_4_0: 
+[2022/04/15 12:18:54] root INFO: 	mean diff: check passed: True, value: 0.0
+[2022/04/15 12:18:54] root INFO: dataloader_4_1: 
+[2022/04/15 12:18:54] root INFO: 	mean diff: check passed: True, value: 0.0
+[2022/04/15 12:18:54] root INFO: dataloader_4_2: 
+[2022/04/15 12:18:54] root INFO: 	mean diff: check passed: True, value: 0.0
+[2022/04/15 12:18:54] root INFO: dataloader_4_3: 
+[2022/04/15 12:18:54] root INFO: 	mean diff: check passed: True, value: 0.0
+[2022/04/15 12:18:54] root INFO: dataloader_4_4: 
+[2022/04/15 12:18:54] root INFO: 	mean diff: check passed: True, value: 0.0
+[2022/04/15 12:18:54] root INFO: diff check passed
