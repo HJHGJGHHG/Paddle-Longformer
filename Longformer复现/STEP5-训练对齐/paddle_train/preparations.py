@@ -1,14 +1,16 @@
 import json
 import time
-import torch
+import paddle
 import random
 import numpy as np
 import torch.nn as nn
-from itertools import chain
 from typing import List
-from torch.utils.data import Dataset, DataLoader
-from transformers.models.longformer.tokenization_longformer import LongformerTokenizer
-from transformers.models.longformer.modeling_longformer import LongformerPreTrainedModel, LongformerModel
+from itertools import chain
+from paddle.io import Dataset, DataLoader
+from reprod_log import ReprodDiffHelper, ReprodLogger
+
+from tokenizer import LongformerTokenizer
+from modeling import LongformerPreTrainedModel, LongformerModel
 
 
 def normalize_string(s):
@@ -20,13 +22,6 @@ def normalize_string(s):
     s = s.replace(' )', ')')
     s = s.replace(" 's", "'s")
     return ' '.join(s.strip().split())
-
-
-def set_seed(seed):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
 
 
 def get_tokenizer(path):
@@ -86,6 +81,12 @@ class WikihopQA_Dataset(Dataset):
         self.args = args
         self._tokenizer = args.tokenizer
     
+    @staticmethod
+    def collate_single_item(x):
+        # for batch size = 1
+        assert len(x) == 1
+        return [x[0][0].unsqueeze(0), x[0][1].unsqueeze(0), x[0][2], x[0][3]]
+    
     def __len__(self):
         return len(self.instances)
     
@@ -101,16 +102,26 @@ class WikihopQA_Dataset(Dataset):
         answer_index = instance['answer_index']
         
         n_candidates = len(candidate_tokens)
+        sort_order = list(range(n_candidates))
         
         # concat all the candidate_tokens with <s>: <s> + candidates
         all_candidate_tokens = ['<s>'] + query_tokens
         
         # candidates
-        all_candidate_tokens.extend(
-            chain.from_iterable([candidate_tokens[k] for k in list(range(len(candidate_tokens)))]))
+        n_candidates = len(candidate_tokens)
+        sort_order = list(range(n_candidates))
+        if self.shuffle_candidates:
+            random.shuffle(sort_order)
+            new_answer_index = sort_order.index(answer_index)
+            answer_index = new_answer_index
+        all_candidate_tokens.extend(chain.from_iterable([candidate_tokens[k] for k in sort_order]))
         
         # the supports
-        all_support_tokens = list(chain.from_iterable([supports_tokens[k] for k in list(range(len(supports_tokens)))]))
+        n_supports = len(supports_tokens)
+        sort_order = list(range(n_supports))
+        if self.shuffle_candidates:
+            random.shuffle(sort_order)
+        all_support_tokens = list(chain.from_iterable([supports_tokens[k] for k in sort_order]))
         
         # convert to ids
         candidate_ids = self._tokenizer.convert_tokens_to_ids(all_candidate_tokens)
@@ -121,32 +132,30 @@ class WikihopQA_Dataset(Dataset):
         
         # candidate_ids, support_ids, predicted_indices, answer_index
         return {
-            "candidate_ids": torch.tensor(candidate_ids),
-            "support_ids": torch.tensor(support_ids),
-            "predicted_indices": torch.tensor(predicted_indices),
-            "answer_index": torch.tensor([answer_index]),
+            "candidate_ids": paddle.to_tensor(candidate_ids, dtype=paddle.int64),
+            "support_ids": paddle.to_tensor(support_ids, dtype=paddle.int64),
+            "predicted_indices": paddle.to_tensor(predicted_indices, dtype=paddle.int64),
+            "answer_index": paddle.to_tensor([answer_index], dtype=paddle.int64),
         }
 
 
-def get_iter(train_dataset, dev_dataset, train_sampler, dev_sampler):
+def get_iter(train_dataset, dev_dataset):
     train_iter = DataLoader(
         train_dataset,
         batch_size=1,
-        sampler=train_sampler,
-        shuffle=True and train_sampler is None,
+        shuffle=True,
     )
     dev_iter = DataLoader(
         dev_dataset,
         batch_size=1,
-        sampler=dev_sampler,
-        shuffle=False,
+        shuffle=False
     )
     return train_iter, dev_iter
 
 
 class WikihopQAModel(LongformerPreTrainedModel):
     def __init__(self, config, args):
-        super(WikihopQAModel, self).__init__(config)
+        super(WikihopQAModel, self).__init__()
         self.args = args
         self.config = config
         self.longformer = LongformerModel(config, add_pooling_layer=False)
@@ -159,7 +168,7 @@ class WikihopQAModel(LongformerPreTrainedModel):
             self._truncate_seq_len = 1000000000
         
         # Initialize weights and apply final processing
-        self.post_init()
+        self.init_weights()
     
     def forward(
             self,
@@ -173,17 +182,17 @@ class WikihopQAModel(LongformerPreTrainedModel):
         # select the activations we will make predictions at from each element of the list.
         # we are guaranteed the predicted_indices are valid indices since each element
         # of activations list has all of the candidates
-        prediction_activations = [act.index_select(1, predicted_indices.squeeze()) for act in activations]
+        prediction_activations = [paddle.index_select(act, index=predicted_indices.squeeze(), axis=1) for act in
+                                  activations]
         prediction_scores = [
             self.answer_score(prediction_act).squeeze(-1)
             for prediction_act in prediction_activations
         ]
         # prediction_scores is a list of tensors, each is (batch_size, num_predictions)
         # sum across the list for each possible prediction
-        sum_prediction_scores = torch.cat(
-            [pred_scores.unsqueeze(-1) for pred_scores in prediction_scores], dim=-1
-        ).sum(dim=-1)
-        
+        sum_prediction_scores = paddle.sum(paddle.concat(
+            [pred_scores.unsqueeze(-1) for pred_scores in prediction_scores], axis=-1
+        ), axis=-1)
         loss = self.loss_func(sum_prediction_scores, answer_index.squeeze(0))
         
         return loss, sum_prediction_scores
@@ -196,11 +205,11 @@ class WikihopQAModel(LongformerPreTrainedModel):
         
         # attention_mask = 1 for local, 2 for global, 0 for padding (which we can ignore as always batch size=1)
         if candidate_len + support_len <= max_seq_len:
-            token_ids = torch.cat([candidate_ids, support_ids], dim=1)
-            attention_mask = torch.ones(token_ids.shape, dtype=torch.long, device=token_ids.device)
+            token_ids = paddle.concat([candidate_ids, support_ids], axis=1)
+            attention_mask = paddle.ones_like(token_ids, dtype=paddle.int64)
             
             # get global attention
-            global_attention_mask = torch.zeros_like(attention_mask, dtype=torch.long, device=token_ids.device)
+            global_attention_mask = paddle.zeros_like(attention_mask, dtype=paddle.int64)
             # global attention to all candidates
             global_attention_mask[0, :candidate_len] = 1
             
@@ -214,11 +223,11 @@ class WikihopQAModel(LongformerPreTrainedModel):
             available_support_len = max_seq_len - candidate_len
             for start in range(0, support_len, available_support_len):
                 end = min(start + available_support_len, support_len, truncate_seq_len)
-                token_ids = torch.cat([candidate_ids, support_ids[:, start:end]], dim=1)
-                attention_mask = torch.ones(token_ids.shape, dtype=torch.long, device=token_ids.device)
+                token_ids = paddle.concat([candidate_ids, support_ids[:, start:end]], axis=1)
+                attention_mask = paddle.ones_like(token_ids, dtype=paddle.int64)
                 
                 # get global attention
-                global_attention_mask = torch.zeros_like(attention_mask, dtype=torch.long, device=token_ids.device)
+                global_attention_mask = paddle.zeros_like(attention_mask, dtype=paddle.int64)
                 # global attention to all candidates
                 global_attention_mask[0, :candidate_len] = 1
                 

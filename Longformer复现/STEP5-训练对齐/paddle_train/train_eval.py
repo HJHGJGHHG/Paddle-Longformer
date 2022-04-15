@@ -1,25 +1,19 @@
 import os
-import gc
 import time
-import torch
 import errno
-import pandas
+import paddle
 import logging
 import datetime
 import numpy as np
-import torch.distributed as dist
 
 from datasets import load_metric
 from reprod_log import ReprodLogger
-from torch.nn.parallel import DistributedDataParallel as DDP
-from transformers import AdamW, get_linear_schedule_with_warmup
-from transformers.models.longformer.configuration_longformer import LongformerConfig
 
-from preparations import preprocess_data, set_seed, WikihopQA_Dataset, get_iter, WikihopQAModel, get_tokenizer
+from preparations import preprocess_data, WikihopQA_Dataset, get_iter, WikihopQAModel, get_tokenizer
 
 logger = logging.getLogger(__name__)
 logger.setLevel(level=logging.INFO)
-handler = logging.FileHandler("torch_log.txt")
+handler = logging.FileHandler("paddle_log.txt")
 handler.setLevel(logging.INFO)
 formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 handler.setFormatter(formatter)
@@ -37,11 +31,11 @@ def mkdir(path):
 def get_args_parser(add_help=True):
     import argparse
     parser = argparse.ArgumentParser(
-        description="PyTorch WikiHop Training", add_help=add_help)
+        description="Paddle WikiHop Training", add_help=add_help)
     parser.add_argument("--data_cache_dir", default="tokenized.json", help="data cache dir.")
     parser.add_argument("--data_path", default="/root/autodl-tmp/data/wikihop/", help="data dir.")
-    parser.add_argument("--model_name_or_path", default="/root/autodl-tmp/models/longformer-base-4096/",
-                        help="path to pretrained model or model identifier from huggingface.co/models.")
+    parser.add_argument("--model_name_or_path", default="/root/autodl-tmp/models/paddle-longformer-base",
+                        help="paddle model path.")
     parser.add_argument("--device", default="cuda", help="device")
     parser.add_argument("--batch_size", default=8, type=int)  # gradient accumulation steps
     parser.add_argument("--max_length", type=int, default=4096,
@@ -65,7 +59,7 @@ def get_args_parser(add_help=True):
     
     # for ddp
     parser.add_argument("--local_rank", default=-1, type=int)
-    parser.add_argument("--ddp", default=False, type=bool)
+    
     return parser
 
 
@@ -81,10 +75,7 @@ def train_model(args, model, train_iter, dev_iter, scaler, optimizer, lr_schedul
         header = "Epoch: [{}]".format(epoch)
         for i, batch in enumerate(train_iter):
             batch_start_time = time.time()
-            if args.ddp:
-                batch = {k: v.to(args.local_rank) for k, v in batch.items()}
-            else:
-                batch = {k: v.to(args.device) for k, v in batch.items()}
+            batch = {k: v.to(args.local_rank) for k, v in batch.items()}
             with torch.cuda.amp.autocast(enabled=scaler is not None):
                 loss, _ = model(**batch)
             
@@ -99,7 +90,7 @@ def train_model(args, model, train_iter, dev_iter, scaler, optimizer, lr_schedul
             losses.append(loss.item())
             lr_scheduler.step()
             
-            if (i + 1) % args.print_freq == 0 and (not args.ddp or (args.ddp and dist.get_rank() == 0)):
+            if (i + 1) % args.print_freq == 0 and dist.get_rank() == 0:
                 logger.info(header + "  [ {0}/{1} ]  Loss:{2:4f}({5:4f})  lr:{3:e}  instances/s:{4:4f}".format(
                     i + 1,
                     len(train_iter),
@@ -108,25 +99,20 @@ def train_model(args, model, train_iter, dev_iter, scaler, optimizer, lr_schedul
                     1 / (time.time() - batch_start_time),
                     np.mean(losses)
                 ))
-            print(header + "  [ {0}/{1} ]  Loss:{2:4f}({5:4f})  lr:{3:e}  instances/s:{4:4f}".format(
-                i + 1,
-                len(train_iter),
-                loss.item(),
-                lr_scheduler.get_last_lr()[-1],
-                1 / (time.time() - batch_start_time),
-                np.mean(losses)
-            ))
-            
-            del loss
-            del batch
-            gc.collect()
+                print(header + "  [ {0}/{1} ]  Loss:{2:4f}({5:4f})  lr:{3:e}  instances/s:{4:4f}".format(
+                    i + 1,
+                    len(train_iter),
+                    loss.item(),
+                    lr_scheduler.get_last_lr()[-1],
+                    1 / (time.time() - batch_start_time),
+                    np.mean(losses)
+                ))
         
         # finish training
-        torch.cuda.empty_cache()
-        if (args.ddp and torch.distributed.get_rank() == 0) or (not args.ddp):
+        if torch.distributed.get_rank() == 0:
             acc, _ = evaluate_model(args, model, dev_iter, metric)
     
-    if args.output_dir and (not args.ddp or (args.ddp and dist.get_rank() == 0)):
+    if args.output_dir and torch.distributed.get_rank() == 0:
         torch.save(model.module, "model.pt")
     
     total_time = time.time() - start_time
@@ -142,22 +128,19 @@ def evaluate_model(args, model, dev_iter, metric):
     losses = []
     with torch.no_grad():
         for i, batch in enumerate(dev_iter):
-            if args.ddp:
-                batch = {k: v.to(args.local_rank) for k, v in batch.items()}
-            else:
-                batch = {k: v.to(args.device) for k, v in batch.items()}
+            batch = {k: v.to(args.local_rank) for k, v in batch.items()}
             loss, sum_prediction_scores = model(**batch)
             
             losses.append(loss.item())
             metric.add_batch(
                 predictions=sum_prediction_scores.argmax(dim=1),
                 references=batch["answer_index"].squeeze(0), )
-            if (i + 1) % args.print_freq == 0 and (not args.ddp or (args.ddp and dist.get_rank() == 0)):
+            if (i + 1) % args.print_freq == 0 and dist.get_rank() == 0:
                 logger.info(header + "  [ {0}/{1} ]  Loss:{2:4f}".format(i + 1, len(dev_iter), loss.item()))
                 print(header + "  [ {0}/{1} ]  Loss:{2:4f}".format(i + 1, len(dev_iter), loss.item()))
     
     acc_global_avg = metric.compute()["accuracy"]
-    if (args.ddp and torch.distributed.get_rank() == 0) or (not args.ddp):
+    if dist.get_rank() == 0:
         print(" * Accuracy {acc_global_avg:.10f}".format(
             acc_global_avg=acc_global_avg))
         logger.info(" * Accuracy {acc_global_avg:.10f}".format(
@@ -170,14 +153,11 @@ def main(args):
         mkdir(args.output_dir)
     scaler = None
     if args.fp16:
-        scaler = torch.cuda.amp.GradScaler()
-    torch.backends.cudnn.benchmark = True
+        scaler = paddle.amp.GradScaler()
     
-    if args.ddp:
-        local_rank = args.local_rank
-        torch.cuda.set_device(local_rank)
-        dist.init_process_group(backend='nccl', init_method='env://')
-    if (args.ddp and torch.distributed.get_rank() == 0) or (not args.ddp):
+    local_rank = args.local_rank
+    paddle.distributed.init_parallel_env()
+    if dist.get_rank() == 0:
         print(args)
         logger.info(args)
     
@@ -190,11 +170,8 @@ def main(args):
     train_dataset = WikihopQA_Dataset(args, file_dir="train." + args.data_cache_dir)
     dev_dataset = WikihopQA_Dataset(args, file_dir="dev." + args.data_cache_dir)
     # train_dataset = dev_dataset  # debug
-    if args.ddp:
-        train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset, shuffle=True)
-        dev_sampler = torch.utils.data.distributed.DistributedSampler(dev_dataset, shuffle=False)
-    else:
-        train_sampler, dev_sampler = None, None
+    train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset, shuffle=True)
+    dev_sampler = torch.utils.data.distributed.DistributedSampler(dev_dataset, shuffle=False)
     train_iter, dev_iter = get_iter(train_dataset, dev_dataset, train_sampler, dev_sampler)
     
     print("Creating model")
@@ -204,11 +181,8 @@ def main(args):
     classifier_weights = torch.load(
         "/root/autodl-tmp/Paddle-Longformer/Longformer复现/STEP5-训练对齐/classifier_weights/torch_classifier_weights.bin")
     model.load_state_dict(classifier_weights, strict=False)
-    if args.ddp:
-        model.to(local_rank)
-        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
-    else:
-        model.to(args.device)
+    model.to(local_rank)
+    model = DDP(model, device_ids=[local_rank], output_device=local_rank)
     
     print("Creating optimizer")
     # Split weights in two groups, one with weight decay and the other not.
@@ -246,7 +220,7 @@ def main(args):
 
 if __name__ == "__main__":
     args = get_args_parser().parse_args()
-    set_seed(args.seed)
+    paddle.seed(args.seed)
     tokenizer = get_tokenizer(args.model_name_or_path)
     args.tokenizer = tokenizer
     acc, losses = main(args)
@@ -254,4 +228,4 @@ if __name__ == "__main__":
     reprod_logger = ReprodLogger()
     reprod_logger.add("acc", np.array([acc]))
     reprod_logger.save("train_align_benchmark.npy")
-    np.save("torch_losses.npy", np.array(losses))
+    np.save("paddle_losses.npy", np.array(losses))
