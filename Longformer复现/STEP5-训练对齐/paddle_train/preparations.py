@@ -1,13 +1,11 @@
 import json
 import time
 import paddle
-import random
-import numpy as np
-import torch.nn as nn
+import paddle.nn as nn
+
 from typing import List
 from itertools import chain
 from paddle.io import Dataset, DataLoader
-from reprod_log import ReprodDiffHelper, ReprodLogger
 
 from tokenizer import LongformerTokenizer
 from modeling import LongformerPreTrainedModel, LongformerModel
@@ -81,12 +79,6 @@ class WikihopQA_Dataset(Dataset):
         self.args = args
         self._tokenizer = args.tokenizer
     
-    @staticmethod
-    def collate_single_item(x):
-        # for batch size = 1
-        assert len(x) == 1
-        return [x[0][0].unsqueeze(0), x[0][1].unsqueeze(0), x[0][2], x[0][3]]
-    
     def __len__(self):
         return len(self.instances)
     
@@ -101,26 +93,17 @@ class WikihopQA_Dataset(Dataset):
         query_tokens = instance['query_tokens']
         answer_index = instance['answer_index']
         
-        n_candidates = len(candidate_tokens)
-        sort_order = list(range(n_candidates))
-        
         # concat all the candidate_tokens with <s>: <s> + candidates
         all_candidate_tokens = ['<s>'] + query_tokens
         
         # candidates
         n_candidates = len(candidate_tokens)
         sort_order = list(range(n_candidates))
-        if self.shuffle_candidates:
-            random.shuffle(sort_order)
-            new_answer_index = sort_order.index(answer_index)
-            answer_index = new_answer_index
         all_candidate_tokens.extend(chain.from_iterable([candidate_tokens[k] for k in sort_order]))
         
         # the supports
         n_supports = len(supports_tokens)
         sort_order = list(range(n_supports))
-        if self.shuffle_candidates:
-            random.shuffle(sort_order)
         all_support_tokens = list(chain.from_iterable([supports_tokens[k] for k in sort_order]))
         
         # convert to ids
@@ -154,12 +137,11 @@ def get_iter(train_dataset, dev_dataset):
 
 
 class WikihopQAModel(LongformerPreTrainedModel):
-    def __init__(self, config, args):
+    def __init__(self, args):
         super(WikihopQAModel, self).__init__()
         self.args = args
-        self.config = config
-        self.longformer = LongformerModel(config, add_pooling_layer=False)
-        self.answer_score = nn.Linear(self.longformer.embeddings.word_embeddings.weight.shape[1], 1, bias=False)
+        self.longformer = LongformerModel.from_pretrained(args.model_name_or_path, add_pooling_layer=False)
+        self.answer_score = nn.Linear(self.longformer.embeddings.word_embeddings.weight.shape[1], 1, bias_attr=False)
         self.loss_func = nn.CrossEntropyLoss(reduction='sum')
         
         self._truncate_seq_len = self.args.truncate_seq_len

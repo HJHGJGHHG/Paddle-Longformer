@@ -128,7 +128,7 @@ class WikihopQA_Dataset(Dataset):
         }
 
 
-def get_iter(train_dataset, dev_dataset, train_sampler, dev_sampler):
+def get_iter(train_dataset, dev_dataset, train_sampler=None, dev_sampler=None):
     train_iter = DataLoader(
         train_dataset,
         batch_size=1,

@@ -1,20 +1,15 @@
 import os
-import gc
 import time
 import torch
-import errno
-import pandas
 import logging
 import datetime
 import numpy as np
-import torch.distributed as dist
-
 from datasets import load_metric
 from reprod_log import ReprodLogger
-from torch.nn.parallel import DistributedDataParallel as DDP
 from transformers import AdamW, get_linear_schedule_with_warmup
 from transformers.models.longformer.configuration_longformer import LongformerConfig
 
+import utils
 from preparations import preprocess_data, set_seed, WikihopQA_Dataset, get_iter, WikihopQAModel, get_tokenizer
 
 logger = logging.getLogger(__name__)
@@ -24,14 +19,6 @@ handler.setLevel(logging.INFO)
 formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 handler.setFormatter(formatter)
 logger.addHandler(handler)
-
-
-def mkdir(path):
-    try:
-        os.makedirs(path)
-    except OSError as e:
-        if e.errno != errno.EEXIST:
-            raise
 
 
 def get_args_parser(add_help=True):
@@ -49,23 +36,23 @@ def get_args_parser(add_help=True):
     parser.add_argument("--truncate_seq_len", default=1000000000, type=int)
     parser.add_argument("--num_train_epochs", default=1, type=int,
                         help="number of total epochs to run")
+    parser.add_argument("--workers", default=0, type=int,
+                        help="number of data loading workers (default: 0)", )
     parser.add_argument("--lr", default=3e-5, type=float, help="initial learning rate")
     parser.add_argument("--weight_decay", default=1e-2, type=float,
                         help="weight decay (default: 1e-2)", dest="weight_decay", )
+    parser.add_argument("--lr_scheduler_type", default="linear", help="the scheduler type to use.")
     parser.add_argument("--num_warmup_steps", default=200, type=int,
                         help="number of steps for the warmup in the lr scheduler.", )
-    parser.add_argument("--val-check-interval", type=int, default=250,
+    parser.add_argument("--val-check-interval", type=int, default=1000,
                         help="number of gradient updates between checking validation loss")
-    parser.add_argument("--print_freq", default=50, type=int, help="print frequency")
-    parser.add_argument("--output_dir", default=None, help="path where to save")
-    parser.add_argument("--test_only", action="store_true", help="only test the model")
+    parser.add_argument("--print_freq", default=10, type=int, help="print frequency")
+    parser.add_argument("--output_dir", default="outputs", help="path where to save")
+    parser.add_argument("--test_only", help="only test the model", action="store_true", )
     parser.add_argument("--seed", default=42, type=int, help="a seed for reproducible training.")
     # Mixed precision training parameters
     parser.add_argument("--fp16", action="store_true", help="whether or not mixed precision training")
     
-    # for ddp
-    parser.add_argument("--local_rank", default=-1, type=int)
-    parser.add_argument("--ddp", default=False, type=bool)
     return parser
 
 
@@ -73,18 +60,20 @@ def train_model(args, model, train_iter, dev_iter, scaler, optimizer, lr_schedul
     print("Start training")
     start_time = time.time()
     losses = []
-    acc = 0
     for epoch in range(args.num_train_epochs):
-        model.train()
-        torch.distributed.barrier()
-        
         header = "Epoch: [{}]".format(epoch)
-        for i, batch in enumerate(train_iter):
+        metric_logger = utils.MetricLogger(logger=logger, delimiter="  ")
+        metric_logger.add_meter(
+            "lr", utils.SmoothedValue(
+                window_size=1, fmt="{value}"))
+        metric_logger.add_meter(
+            "instances/s", utils.SmoothedValue(
+                window_size=10, fmt="{value}"))
+        steps = 0
+        for batch in metric_logger.log_every(train_iter, args.print_freq, header):
+            model.train()
             batch_start_time = time.time()
-            if args.ddp:
-                batch = {k: v.to(args.local_rank) for k, v in batch.items()}
-            else:
-                batch = {k: v.to(args.device) for k, v in batch.items()}
+            batch = {k: v.to(args.device) for k, v in batch.items()}
             with torch.cuda.amp.autocast(enabled=scaler is not None):
                 loss, _ = model(**batch)
             
@@ -98,104 +87,69 @@ def train_model(args, model, train_iter, dev_iter, scaler, optimizer, lr_schedul
                 optimizer.step()
             losses.append(loss.item())
             lr_scheduler.step()
+            metric_logger.update(
+                loss=loss.item(), lr=lr_scheduler.get_last_lr()[-1])
+            metric_logger.meters["instances/s"].update(1 /
+                                                       (time.time() - batch_start_time))
             
-            if (i + 1) % args.print_freq == 0 and (not args.ddp or (args.ddp and dist.get_rank() == 0)):
-                logger.info(header + "  [ {0}/{1} ]  Loss:{2:4f}({5:4f})  lr:{3:e}  instances/s:{4:4f}".format(
-                    i + 1,
-                    len(train_iter),
-                    loss.item(),
-                    lr_scheduler.get_last_lr()[-1],
-                    1 / (time.time() - batch_start_time),
-                    np.mean(losses)
-                ))
-            print(header + "  [ {0}/{1} ]  Loss:{2:4f}({5:4f})  lr:{3:e}  instances/s:{4:4f}".format(
-                i + 1,
-                len(train_iter),
-                loss.item(),
-                lr_scheduler.get_last_lr()[-1],
-                1 / (time.time() - batch_start_time),
-                np.mean(losses)
-            ))
-            
-            del loss
-            del batch
-            gc.collect()
-        
-        # finish training
-        torch.cuda.empty_cache()
-        if (args.ddp and torch.distributed.get_rank() == 0) or (not args.ddp):
-            acc, _ = evaluate_model(args, model, dev_iter, metric)
+            if (steps + 1) % args.val_check_interval == 0:
+                evaluate_model(args, model, dev_iter, metric)
+            steps += 1
     
-    if args.output_dir and (not args.ddp or (args.ddp and dist.get_rank() == 0)):
-        torch.save(model.module, "model.pt")
+    # finish training
+    acc = evaluate_model(args, model, dev_iter, metric)
+    if args.output_dir:
+        model.save_pretrained(args.output_dir)
     
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-    logger.info("Training time {}".format(total_time_str))
     print("Training time {}".format(total_time_str))
     return acc, losses
 
 
-def evaluate_model(args, model, dev_iter, metric):
+def evaluate_model(args, model, dev_iter, metric, print_freq=2000):
     model.eval()
+    metric_logger = utils.MetricLogger(logger=logger, delimiter="  ")
     header = "Test:"
-    losses = []
     with torch.no_grad():
-        for i, batch in enumerate(dev_iter):
-            if args.ddp:
-                batch = {k: v.to(args.local_rank) for k, v in batch.items()}
-            else:
-                batch = {k: v.to(args.device) for k, v in batch.items()}
+        for batch in metric_logger.log_every(dev_iter, print_freq, header):
+            batch = {k: v.to(args.device) for k, v in batch.items()}
             loss, sum_prediction_scores = model(**batch)
             
-            losses.append(loss.item())
+            metric_logger.update(loss=loss.item())
             metric.add_batch(
                 predictions=sum_prediction_scores.argmax(dim=1),
-                references=batch["answer_index"].squeeze(0), )
-            if (i + 1) % args.print_freq == 0 and (not args.ddp or (args.ddp and dist.get_rank() == 0)):
-                logger.info(header + "  [ {0}/{1} ]  Loss:{2:4f}".format(i + 1, len(dev_iter), loss.item()))
-                print(header + "  [ {0}/{1} ]  Loss:{2:4f}".format(i + 1, len(dev_iter), loss.item()))
+                references=batch["answer_index"], )
     
     acc_global_avg = metric.compute()["accuracy"]
-    if (args.ddp and torch.distributed.get_rank() == 0) or (not args.ddp):
-        print(" * Accuracy {acc_global_avg:.10f}".format(
-            acc_global_avg=acc_global_avg))
-        logger.info(" * Accuracy {acc_global_avg:.10f}".format(
-            acc_global_avg=acc_global_avg))
-    return acc_global_avg, losses
+    # gather the stats from all processes
+    metric_logger.synchronize_between_processes()
+    print(" * Accuracy {acc_global_avg:.10f}".format(
+        acc_global_avg=acc_global_avg))
+    logger.info(" * Accuracy {acc_global_avg:.10f}".format(
+        acc_global_avg=acc_global_avg))
+    return acc_global_avg
 
 
 def main(args):
     if args.output_dir:
-        mkdir(args.output_dir)
+        utils.mkdir(args.output_dir)
+    print(args)
+    logger.info(args)
     scaler = None
     if args.fp16:
         scaler = torch.cuda.amp.GradScaler()
     torch.backends.cudnn.benchmark = True
     
-    if args.ddp:
-        local_rank = args.local_rank
-        torch.cuda.set_device(local_rank)
-        dist.init_process_group(backend='nccl', init_method='env://')
-    if (args.ddp and torch.distributed.get_rank() == 0) or (not args.ddp):
-        print(args)
-        logger.info(args)
-    
     if os.path.exists("dev." + args.data_cache_dir) and os.path.exists("train." + args.data_cache_dir):
         print("Loading preprocessed data..")
     else:
         preprocess_data(args)
-        print("Loading preprocessed data..")
     
     train_dataset = WikihopQA_Dataset(args, file_dir="train." + args.data_cache_dir)
     dev_dataset = WikihopQA_Dataset(args, file_dir="dev." + args.data_cache_dir)
     # train_dataset = dev_dataset  # debug
-    if args.ddp:
-        train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset, shuffle=True)
-        dev_sampler = torch.utils.data.distributed.DistributedSampler(dev_dataset, shuffle=False)
-    else:
-        train_sampler, dev_sampler = None, None
-    train_iter, dev_iter = get_iter(train_dataset, dev_dataset, train_sampler, dev_sampler)
+    train_iter, dev_iter = get_iter(train_dataset, dev_dataset)
     
     print("Creating model")
     config = LongformerConfig.from_pretrained(args.model_name_or_path)
@@ -204,11 +158,7 @@ def main(args):
     classifier_weights = torch.load(
         "/root/autodl-tmp/Paddle-Longformer/Longformer复现/STEP5-训练对齐/classifier_weights/torch_classifier_weights.bin")
     model.load_state_dict(classifier_weights, strict=False)
-    if args.ddp:
-        model.to(local_rank)
-        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
-    else:
-        model.to(args.device)
+    model.to(args.device)
     
     print("Creating optimizer")
     # Split weights in two groups, one with weight decay and the other not.
@@ -237,10 +187,7 @@ def main(args):
     
     metric = load_metric("metric.py")
     
-    if args.test_only:
-        acc, losses = evaluate_model(args, model, dev_iter, metric)
-    else:
-        acc, losses = train_model(args, model, train_iter, dev_iter, scaler, optimizer, lr_scheduler, metric)
+    acc, losses = train_model(args, model, train_iter, dev_iter, scaler, optimizer, lr_scheduler, metric)
     return acc, losses
 
 
