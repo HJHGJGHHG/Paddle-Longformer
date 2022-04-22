@@ -29,7 +29,7 @@ def get_args_parser(add_help=True):
     parser.add_argument("--data_path", default="/root/autodl-tmp/data/wikihop/", help="data dir.")
     parser.add_argument("--model_name_or_path", default="/root/autodl-tmp/models/paddle-longformer-base/",
                         help="path to pretrained model or model identifier from huggingface.co/models.")
-    parser.add_argument("--device", default="cuda", help="device")
+    parser.add_argument("--device", default="gpu", help="device")
     parser.add_argument("--batch_size", default=8, type=int)  # gradient accumulation steps
     parser.add_argument("--max_length", type=int, default=4096,
                         help="The maximum total input sequence length after tokenization. Sequences longer than this will be truncated,")
@@ -73,7 +73,6 @@ def train_model(args, model, train_iter, dev_iter, scaler, optimizer, lr_schedul
         for batch in metric_logger.log_every(train_iter, args.print_freq, header):
             model.train()
             batch_start_time = time.time()
-            batch = {k: v.to(args.device) for k, v in batch.items()}
             with paddle.amp.auto_cast(
                     enable=scaler is not None,
                     custom_white_list=["layer_norm", "softmax", "gelu"], ):
@@ -150,12 +149,11 @@ def main(args):
     
     train_dataset = WikihopQA_Dataset(args, file_dir="train." + args.data_cache_dir)
     dev_dataset = WikihopQA_Dataset(args, file_dir="dev." + args.data_cache_dir)
-    # train_dataset = dev_dataset  # debug
     train_iter, dev_iter = get_iter(train_dataset, dev_dataset)
     
     print("Creating model")
     model = WikihopQAModel(args)
-    model.resize_token_embeddings(len(args.tokenizer))
+    # model.resize_token_embeddings(len(args.tokenizer))
     classifier_weights = paddle.load(
         "/root/autodl-tmp/Paddle-Longformer/Longformer复现/STEP5-训练对齐/classifier_weights/paddle_classifier_weights.bin")
     model.load_dict(classifier_weights)
@@ -188,7 +186,7 @@ def main(args):
 
 
 if __name__ == "__main__":
-    args = get_args_parser().parse_args([])
+    args = get_args_parser().parse_args()
     paddle.seed(args.seed)
     tokenizer = get_tokenizer(args.model_name_or_path)
     args.tokenizer = tokenizer

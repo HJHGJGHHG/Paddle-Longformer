@@ -198,8 +198,7 @@ class WikihopQAModel(LongformerPreTrainedModel):
             return [self.longformer(
                 token_ids,
                 attention_mask=attention_mask,
-                global_attention_mask=global_attention_mask,
-                return_dict=False)[0]]
+                global_attention_mask=global_attention_mask,)[0]]
         else:
             all_activations = []
             available_support_len = max_seq_len - candidate_len
@@ -216,8 +215,7 @@ class WikihopQAModel(LongformerPreTrainedModel):
                 activations = self.longformer(
                     token_ids,
                     attention_mask=attention_mask,
-                    global_attention_mask=global_attention_mask,
-                    return_dict=False)[0]
+                    global_attention_mask=global_attention_mask,)[0]
                 all_activations.append(activations)
                 if end == truncate_seq_len:
                     break

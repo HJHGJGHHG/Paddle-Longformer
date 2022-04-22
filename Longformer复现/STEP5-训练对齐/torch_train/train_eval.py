@@ -36,20 +36,17 @@ def get_args_parser(add_help=True):
     parser.add_argument("--truncate_seq_len", default=1000000000, type=int)
     parser.add_argument("--num_train_epochs", default=1, type=int,
                         help="number of total epochs to run")
-    parser.add_argument("--workers", default=0, type=int,
-                        help="number of data loading workers (default: 0)", )
     parser.add_argument("--lr", default=3e-5, type=float, help="initial learning rate")
     parser.add_argument("--weight_decay", default=1e-2, type=float,
                         help="weight decay (default: 1e-2)", dest="weight_decay", )
-    parser.add_argument("--lr_scheduler_type", default="linear", help="the scheduler type to use.")
     parser.add_argument("--num_warmup_steps", default=200, type=int,
                         help="number of steps for the warmup in the lr scheduler.", )
-    parser.add_argument("--val-check-interval", type=int, default=1000,
+    parser.add_argument("--val-check-interval", type=int, default=1500,
                         help="number of gradient updates between checking validation loss")
-    parser.add_argument("--print_freq", default=10, type=int, help="print frequency")
+    parser.add_argument("--print_freq", default=50, type=int, help="print frequency")
     parser.add_argument("--output_dir", default="outputs", help="path where to save")
     parser.add_argument("--test_only", help="only test the model", action="store_true", )
-    parser.add_argument("--seed", default=42, type=int, help="a seed for reproducible training.")
+    parser.add_argument("--seed", default=4321, type=int, help="a seed for reproducible training.")
     # Mixed precision training parameters
     parser.add_argument("--fp16", action="store_true", help="whether or not mixed precision training")
     
@@ -119,7 +116,7 @@ def evaluate_model(args, model, dev_iter, metric, print_freq=2000):
             metric_logger.update(loss=loss.item())
             metric.add_batch(
                 predictions=sum_prediction_scores.argmax(dim=1),
-                references=batch["answer_index"], )
+                references=batch["answer_index"].squeeze(0), )
     
     acc_global_avg = metric.compute()["accuracy"]
     # gather the stats from all processes
